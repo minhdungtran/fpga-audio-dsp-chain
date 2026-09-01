@@ -1,0 +1,24 @@
+# General simulation logs and dumps
+*.log
+*.vcd
+*.wlf
+*.xml
+*.fst
+*.vvp
+*.Identifier
+
+# Simulation build directories
+work/
+obj_dir/
+sim_build/
+__pycache__/.vscode/
+
+# Vivado build files
+fpga/DSP.cache/
+fpga/DSP.hw/
+fpga/DSP.ip_user_files/
+fpga/DSP.runs/
+fpga/DSP.sim/
+*.jou
+*.log
+*.str

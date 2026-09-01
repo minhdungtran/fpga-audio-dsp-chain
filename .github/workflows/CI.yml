@@ -1,0 +1,60 @@
+name: cocotb verification tests
+
+on: 
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  tests:
+    runs-on: ubuntu-24.04
+
+    steps: 
+      - name: check the repository
+        uses: actions/checkout@v4
+      
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with: 
+          python-version: '3.12'
+      
+      - name: Install Python dependencies
+        run: pip install -r requirement.txt
+
+      - name: Install Icaris Verilog
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y iverilog
+        
+      - name: Run unit tests
+        run: |
+          set -e
+          for dir in tb/unit/*/; do
+            if [ -f "$dir/Makefile" ]; then
+              echo "::group::${dir}"
+              make -C "$dir"
+              echo "::endgroup"
+            fi
+          done
+
+      - name: Run integration tests
+        run: |
+          set -e
+          for dir in tb/integration/*/; do
+            if [ -f "$dir/Makefile" ]; then
+              echo "::group::${dir}"
+              make -C "$dir"
+              echo "::endgroup"
+            fi
+          done
+
+      - name: Upload test artifacts on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cocotb-results
+          path: |
+            tb/**/results.xml
+            tb/**/sim_build/**
+          if-no-files-found: ignore
