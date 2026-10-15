@@ -1,4 +1,4 @@
-.DEFAULT_GOAL := sim
+.DEFAULT_GOAL := verilator
 
 SIM ?= icarus
 TOPLEVEL_LANG ?= verilog

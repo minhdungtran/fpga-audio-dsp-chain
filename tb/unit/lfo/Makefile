@@ -1,4 +1,4 @@
-SIM ?= icarus
+SIM ?= verilator
 TOPLEVEL_LANG ?= verilog
 
 ROOT := $(abspath $(PWD)/../../..)

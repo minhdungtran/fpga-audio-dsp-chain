@@ -1,5 +1,5 @@
 .DEFAULT_GOAL := sim
-SIM ?= icarus
+SIM ?= verilator
 TOPLEVEL_LANG ?= verilog
 
 ROOT := $(abspath $(CURDIR)/../../..)
