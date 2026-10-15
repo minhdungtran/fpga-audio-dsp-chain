@@ -1,93 +1,57 @@
 # FPGA Audio DSP Chain
 [![CI](https://github.com/minhdungtran/fpga-audio-dsp-chain/actions/workflows/CI.yml/badge.svg)](https://github.com/minhdungtran/fpga-audio-dsp-chain/actions/workflows/CI.yml)
 
-A digital audio effects pipeline implemented in RTL, verified in simulation, and synthesized
-for Artix-7 FPGA . Audio comes in over I2S, passes through a
-gain stage, an FIR filter, and a tremolo effect, and goes back out over I2S.
+A fixed-point digital audio effects pipeline implemented in Verilog and verified with Cocotb.
 
 ## Author
 
 **Author:** Tran Minh Dung  
 **HDL:** Verilog  
 **Verification:** Cocotb  
-**Synthesis:** Vivado
+
+## Final Goal
+
+The final goal of the project is to demonstrate the DSP chain on FPGA hardware as a low-latency real-time guitar effects processor. Guitar signals will be fed into the system, processed by the FPGA, and output as modified audio. The design will function similarly to a digital effects pedal.
 
 ## Signal Chain
 
 ```
-I2S RX → FIFO → Amp → FIR Filter → Tremolo (LFO + Amp) → Async FIFO → I2S TX
+I2S RX → Async FIFO → Amp → FIR Filter → Tremolo (LFO + Amp) → Async FIFO → I2S TX
 ```
 
 ## Clock Domains
 
-The design spans two independent, asynchronous clock domains, crossed via the async FIFO at the
-DSP → I2S TX boundary:
+The design spans two independent, asynchronous clock domains, with the DSP effects running at a higher frequency.
 
-| Clock | Period | Frequency | Domain |
-|---|---|---|---|
-| `dsp_clk` | 20.000 ns | 50 MHz | RTL processing (Amp, FIR, Tremolo) |
-| `i2s_clk` | 325.520 ns | ≈3.072 MHz | I2S bit clock (RX/TX) |
+| Clock | Domain |
+|---|---|
+| `dsp_clk` | RTL processing (Amp, FIR, Tremolo) |
+| `i2s_clk` | I2S bit clock (RX/TX) |
 
-Constrained in [`constraints/timing_constraint.xdc`](constraints/timing_constraint.xdc), with
-`set_clock_groups -asynchronous` declared between the two. At 32-bit stereo slots, the I2S bit
-clock corresponds to a ≈48 kHz audio sample rate.
 
-> **Scope note:** this project is currently verified through simulation and carried through
-> synthesis/implementation for timing closure only — no physical FPGA board yet. Accordingly,
-> `timing_constraint.xdc` defines clocks only; I/O pin constraints will be added once hardware
-> is available to generate a real bitstream.
+> **Scope note:** The current project has been implemented and verified in simulation, so no final hardware clock frequency is specified yet. The DSP clock must be fast enough for continuous audio processing without dropping samples. A later project phase will establish a synthesis/timing baseline and optimize the RTL for high Fmax and low processing latency.
 
-## Features
+## Quick start && Requirements
+For the current projects, the following tools are required:
+- Python 3
+- python3-venv
+- GNU Make
+- Verilator 5.036+
 
-- **I2S receiver (`I2S_rv`)** — standard I2S timing, MSB-first, one `WS`-clock frame-sync delay
-- **I2S transmitter (`I2S_TX`)** — serializes stereo samples back out on `SD`, MSB-first, with double-buffered sample loading so a new frame is always ready when `WS` switches channels
-- **Synchronous FIFO** — buffers samples between I2S and processing clock domains
-- **Amplifier (`Amplifier`)** — signed Q2.14 fixed-point gain with saturation
-- **FIR filter (`FIR`)** — 63-tap stereo low-pass filter, time-multiplexed over a single shared MAC datapath
-- **Tremolo (`tremolo_lfo` + `Amplifier`)** — an LFO computes a time-varying gain, which drives a second amplifier stage to modulate volume
-- **Asynchronous FIFO** — clock-domain crossing back to the I2S TX clock domain
-- **Configurable effect chain** — top-level `amp_en` / `fir_en` / `trem_en` controls let each stage be independently bypassed or reconfigured at runtime
-- **Fully verified** — unit tests per module plus full-chain integration tests (see `tb/`)
-
-## Repository Structure
-
+To start the project, create and activate a virtual environment:
 ```
-.
-├── .github/
-│   └── workflows/
-│       └── cocotb-tests.yml   # CI: runs every testbench on push/PR
-├── coefficients/          # FIR filter coefficient files (.mem) and generation script
-│   ├── fir_8khz_63tap_q15.mem
-│   └── FIR_coefficient.py
-├── constraints/           # Vivado timing constraints
-│   └── timing_constraint.xdc
-├── docs/                  # Simulation and synthesis / implementation evidence
-│   ├── implemented_design.png
-│   ├── timing_summary.png
-│   ├── utilization_report.txt
-│   └── dsp_waveform.png
-├── fpga/
-│   ├── DSP.xpr              # Vivado project file
-│   ├── rtl/                # Synthesizable RTL
-│   │   ├── effects/          # Tremolo / audio effect modules
-│   │   ├── fifo/               # Synchronous FIFO
-│   │   ├── fifo_integration/
-│   │   ├── i2s/                  # I2S receiver / transmitter
-│   │   └── top/                    # Top-level integration
-│   └── tb/                 # Testbenches
-│       ├── integration/      # Full-pipeline / system-level tests
-│       │   ├── Audio_Passthrough/
-│       │   ├── dsp_amp/
-│       │   ├── dsp_chain/
-│       │   ├── dsp_fir/
-│       │   ├── dsp_tremolo/
-│       │   ├── fir_tx/
-│       │   └── rv_fir/
-│       └── unit/            # Per-module unit tests
-├── .gitignore
-├── requirements.txt        # cocotb + numpy, pinned to match local versions
-└── README.md
+cd fpga-audio-dsp-chain
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
 ```
+The following Make targets are available:
+|Command|Description|
+|---|---|
+|make all| Run lint and all verification tests|
+|make test| Run all cocotb unit and integration tests|
+|make lint| Run Verilator lint checks on the RTL|
+|make clean| Remove generated simulation files|
 
 ## Module Documentation
 
@@ -164,9 +128,7 @@ blocks form the tremolo effect.
 ## Verification
 
 All testbenches are written in [cocotb](https://www.cocotb.org/). Modules with numeric behavior
-(FIR, Amplifier, LFO, and the full DSP chain) are checked bit-exact against Python golden models
-— the FIR model even loads the same `.mem` coefficient file used in synthesis, so the testbench
-and the hardware are guaranteed to agree on coefficients.
+(FIR, Amplifier, LFO, and the full DSP chain) are checked bit-exact against Python golden models.
 
 ### Unit Tests (`tb/unit/`)
 
@@ -241,54 +203,12 @@ that the pipeline wiring carries samples through amp → FIR → tremolo without
 `empty_1/2`, `full_1/2`, and `fifo1_rd_en`/`fifo2_rd_en` traces show the FIFO handshaking that
 crosses between the two clock domains.
 
-## Results
-
-**Target device:** Artix-7 35T (`xc7a35tcsg324-1`) · **Vivado:** 2025.2 · **Design state:** Routed
-
-### Resource Utilization
-
-| Resource | Used | Available | Utilization |
-|---|---|---|---|
-| Slice LUTs | 671 | 20,800 | 3.23% |
-| Slice Registers | 1,105 | 41,600 | 2.66% |
-| DSP48E1 slices | 6 | 90 | 6.67% |
-| Block RAM (36Kb tiles) | 0.5 | 50 | 1.00% |
-| Bonded IOB | 56 | 210 | 26.67% |
-
-A small footprint overall — logic, register, and DSP usage are all under 7%. IOB is the highest
-utilization figure, driven by the parallel audio/I2S pins rather than by logic complexity. Full
-hierarchical breakdown: [`docs/utilization_report.txt`](docs/utilization_report.txt).
-
-### Timing
-
-All user-specified timing constraints are met, with zero failing endpoints:
-
-| | Worst Slack | Failing Endpoints | Total Endpoints |
-|---|---|---|---|
-| Setup (WNS) | 7.477 ns | 0 | 3,354 |
-| Hold (WHS) | 0.037 ns | 0 | 3,354 |
-| Pulse Width (WPWS) | 8.750 ns | 0 | 1,305 |
-
-![Timing Summary](docs/timing_summary.png)
-
-7.477 ns of setup slack on the 20 ns `dsp_clk` period means the critical path could close at
-roughly **80 MHz** — well above the 50 MHz it's actually run at, leaving comfortable margin for
-a faster processing clock in a future revision. Hold slack (37 ps) is comfortably positive but
-tight; worth re-checking after any future placement/routing changes.
-
-### Implementation Layout
-
-![Implemented Design Layout](docs/implemented_design.png)
-<!-- Device view after place & route, showing resource placement across clock regions X0Y0–X1Y2 -->
-
-
-
-## Known Issues / Future Work
-
-- [  ] Add board I/O pin constraints and produce a real bitstream once physical hardware is available (currently timing-constraints-only)
-- [  ] Add a short audio demo (video/gif) of the hardware in action, once a physical board is available
-- [  ] Make the order of DSP effects dynamically rearrangeable
-- [  ] Implement more effects
+# Project Goals
+- [ ] Establish synthesis and timing baseline
+- [ ] Optimize DSP processing latency and throughput
+- [ ] Deploy the design to an Arty Z7-20
+- [ ] Interface an external I2S ADC/DAC
+- [ ] Demonstrate real-time guitar processing
 
 ## License
 
