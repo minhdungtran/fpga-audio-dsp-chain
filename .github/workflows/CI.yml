@@ -1,4 +1,4 @@
-name: cocotb verification tests
+name: rtl/verification tests
 
 on: 
   push:
@@ -22,32 +22,22 @@ jobs:
       - name: Install Python dependencies
         run: pip install -r requirement.txt
 
-      - name: Install Icaris Verilog
+      - name: Install Verilator build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y iverilog
-        
-      - name: Run unit tests
-        run: |
-          set -e
-          for dir in tb/unit/*/; do
-            if [ -f "$dir/Makefile" ]; then
-              echo "::group::${dir}"
-              make -C "$dir"
-              echo "::endgroup"
-            fi
-          done
+          sudo apt-get install -y git help2man perl make autoconf g++ flex bison ccache libfl2 libfl-dev zlib1g zlib1g-dev
 
-      - name: Run integration tests
+      - name: Install Verilator 5.052
         run: |
-          set -e
-          for dir in tb/integration/*/; do
-            if [ -f "$dir/Makefile" ]; then
-              echo "::group::${dir}"
-              make -C "$dir"
-              echo "::endgroup"
-            fi
-          done
+          git clone --depth 1 --branch v5.052 https://github.com/verilator/verilator.git
+          cd verilator
+          autoconf
+          ./configure
+          make -j2
+          sudo make install
+        
+      - name: Run lint and tests
+        run: make all
 
       - name: Upload test artifacts on failure
         if: failure()
