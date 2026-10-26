@@ -60,13 +60,16 @@ Addition configuration and parameters:
 For each channel, the delay is calculated as:
 
 $$
-\begin{aligned}
-r[n] &= \mathrm{memory}[ptr] \
-\mathrm{memory}[ptr] &\leftarrow \mathrm{sat}(x[n] + g,r[n]) \
-y[n] &= \mathrm{sat}((1-w)x[n] + w,r[n])
-\end{aligned}
+r[n] = \mathrm{memory}[ptr]
 $$
 
+$$
+\mathrm{memory}[ptr] \leftarrow \mathrm{sat}(x[n] + g \cdot r[n])
+$$
+
+$$
+y[n] = \mathrm{sat}((1-w)x[n] + w \cdot r[n])
+$$
 The active buffer length in samples is:
 
 $$
