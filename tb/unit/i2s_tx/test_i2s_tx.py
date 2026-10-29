@@ -21,8 +21,8 @@ WIDTH = 24
 async def reset(dut):
 
     dut.reset.value = 1
-    dut.input_LD.value = 0
-    dut.input_RD.value = 0
+    dut.ld_i.value = 0
+    dut.rd_i.value = 0
     dut.WS.value = 1
 
     for _ in range(3):
@@ -47,11 +47,11 @@ async def initialize_i2s_frame_sync(dut):
 
 
 async def pulse_sample_valid(dut, left, right):
-    dut.input_LD.value = left
-    dut.input_RD.value = right
-    dut.data_valid.value = 1
+    dut.ld_i.value = left
+    dut.rd_i.value = right
+    dut.valid_i.value = 1
     await FallingEdge(dut.sck)
-    dut.data_valid.value = 0
+    dut.valid_i.value = 0
 
 
 async def receive_i2s_word(dut, WS, width =WIDTH):
@@ -232,7 +232,7 @@ async def i2s_one_clock_delay_after_ws_edge(dut):
 @cocotb.test()
 async def pending_sample_overwrite_uses_latest_sample(dut):
     """
-    if two data_valid pulses happen before the next WS 1 -> 0, 
+    if two valid_i pulses happen before the next WS 1 -> 0, 
     the second sample overwrites the first.   
     """
     OLD_L = 0xFFFFFF
@@ -287,14 +287,14 @@ async def outputs_zero_after_reset_without_sample(dut):
     )
     
     dut.WS.value = 1
-    dut.input_LD.value = 0xFFFFFF
-    dut.input_RD.value = 0xFFFFFF
-    dut.data_valid.value = 0
+    dut.ld_i.value = 0xFFFFFF
+    dut.rd_i.value = 0xFFFFFF
+    dut.valid_i.value = 0
 
     for _ in range(3):
         await FallingEdge(dut.sck)
         assert int(dut.SD.value) == 0 ,(
-            f"SD should stay at 0 when data_valid is low"
+            f"SD should stay at 0 when valid_i is low"
         )
 
 

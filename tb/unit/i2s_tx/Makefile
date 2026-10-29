@@ -3,7 +3,7 @@ TOPLEVEL_LANG ?= verilog
 
 ROOT := $(abspath $(PWD)/../../..)
 
-VERILOG_SOURCES += $(ROOT)/rtl/i2s/i2s_tx.v
+VERILOG_SOURCES += $(ROOT)/rtl/i2s/i2s_tx.sv
 
 TOPLEVEL = i2s_tx
 
