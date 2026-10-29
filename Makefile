@@ -3,7 +3,7 @@ SIM ?= verilator
 TEST_MAKEFILES := $(shell find tb -type f -name Makefile )
 TEST_DIRS := $(patsubst %/Makefile,%,$(TEST_MAKEFILES))
 
-RTL_FILES := $(shell find rtl -type f -name "*.v")
+RTL_FILES := $(shell find rtl -type f \( -name "*.v" -o -name "*.sv" \))
 
 .PHONY: help lint test clean all
 
@@ -31,3 +31,10 @@ clean:
 	done
 
 all: lint test
+
+%: 
+	@echo "Lint for $@"
+	verilator --lint-only --Wall $(filter %/$@.v %/$@.sv,$(RTL_FILES))
+	
+	@echo "Simulation for $@"
+	$(MAKE) -C $(filter %/$@,$(TEST_DIRS)) SIM=$(SIM)

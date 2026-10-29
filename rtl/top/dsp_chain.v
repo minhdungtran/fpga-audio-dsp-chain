@@ -167,7 +167,7 @@ always @(posedge top_dsp_clk) begin
           end
 
           EFFECT_TREMOLO: begin
-            if (trem_out_valid) begin
+            if (trem_out_valid && !full_2) begin
               if (active_trem_en) begin
                 fifo2_d_in <= {{{PADDING{trem_out_LD[WIDTH-1]}}, trem_out_LD},{{PADDING{trem_out_RD[WIDTH-1]}}, trem_out_RD}};
                 state_1 <= IDLE;
@@ -213,6 +213,9 @@ always @(posedge top_i2s_clk) begin
                 tx_in_ready <= 1;
                 state_2 <= IDLE;
             end
+            default: begin
+                state_2 <= IDLE;
+            end
         endcase
     end
 end
@@ -236,7 +239,7 @@ async_fifo #(
     .rd_en(fifo1_rd_en),
     .wr_clk(top_i2s_clk),
     .wr_reset(top_i2s_reset),
-    .wr_en(rv_out_rd),
+    .wr_en(rv_out_rd && !full_1),
     .d_in(fifo1_d_in),
     .empty(empty_1),
     .full(full_1),

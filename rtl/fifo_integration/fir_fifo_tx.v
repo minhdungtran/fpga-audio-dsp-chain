@@ -62,6 +62,9 @@ always @(posedge top_i2s_clk) begin
                 tx_in_ready <= 1;
                 state <= IDLE;
             end
+            default: begin
+                state <= IDLE;
+            end
         endcase
     end
 end
