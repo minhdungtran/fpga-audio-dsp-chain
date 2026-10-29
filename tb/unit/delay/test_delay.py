@@ -2,12 +2,12 @@ import random as pyrandom
 import numpy as np
 import cocotb
 from cocotb.clock import Clock
-from cocotb.triggers import RisingEdge, FallingEdge
+from cocotb.triggers import RisingEdge, FallingEdge, with_timeout
 
 WIDTH = 24
 FRAC_BITS = 14
 UNITY = 1 << FRAC_BITS
-SAMPLE_F = 48000
+SAMPLE_F = 48
 MAX_DELAY_MS = 500
 C_BUFFER_SIZE = MAX_DELAY_MS * SAMPLE_F//1000
 MAX_24 = (1 << (WIDTH - 1)) - 1   #  8388607
@@ -41,7 +41,7 @@ def delay_model(frames, delay_ms, w, g, bypass):
     assert 0 <= g < (1 << FRAC_BITS)
 
     delay_ms = min(delay_ms, MAX_DELAY_MS)
-    buffer_size = delay_ms * SAMPLE_F//1000
+    buffer_size = delay_ms * SAMPLE_F
     buffer_left = np.zeros(buffer_size, dtype=np.int64)
     buffer_right = np.zeros(buffer_size, dtype=np.int64)
     output = []
@@ -57,9 +57,11 @@ def delay_model(frames, delay_ms, w, g, bypass):
 
         buffer_left[ptr] = sat_clip(ld + ((old_sample_left*g)>>FRAC_BITS), WIDTH)
         buffer_right[ptr] = sat_clip(rd + ((old_sample_right*g)>>FRAC_BITS), WIDTH)
+        diff_left = old_sample_left - ld
+        diff_right = old_sample_right -rd
 
-        output_left = sat_clip(((UNITY-w)*ld + w*old_sample_left)>>FRAC_BITS, WIDTH)
-        output_right = sat_clip(((UNITY-w)*rd + w*old_sample_right)>>FRAC_BITS, WIDTH)
+        output_left = sat_clip(ld + ((w*diff_left)>>FRAC_BITS), WIDTH)
+        output_right = sat_clip(rd + ((w*diff_right)>>FRAC_BITS), WIDTH)
         output.append((output_left,output_right))
 
     return output
@@ -228,10 +230,9 @@ async def test_handshake(dut):
     dut.ready_i.value = 0 # we assume now the next component is not ready to receive samples
     dut.valid_i.value = 0
 
-    await send_input(0, 10, dut)
-
-    output = await receive_output(dut)
-
+    await with_timeout(send_input(0,10,dut), 500000, "ns")
+    output = await with_timeout(receive_output(dut), 500000, "ns")
+    
     assert int(dut.valid_o.value) == 1, "When output is ready, the valid signal should be high"
 
     for _ in range(10):
