@@ -2,7 +2,7 @@ module delay
 #(
     parameter WIDTH = 24,
     parameter FRAC_BITS = 14,
-    parameter SAMPLE_F = 48000,
+    parameter SAMPLE_F = 48,
     parameter MAX_DELAY_MS = 500  
 )
 (
@@ -23,121 +23,143 @@ module delay
     output logic signed [WIDTH-1:0]        rd_o       // Right channel output
 );
 
-localparam C_BUFFER_SIZE = MAX_DELAY_MS*SAMPLE_F/1000;
+localparam C_BUFFER_SIZE = MAX_DELAY_MS*SAMPLE_F;
 localparam BUFFER_ADD_WIDTH = $clog2(C_BUFFER_SIZE);
 localparam EXTEND = WIDTH + FRAC_BITS;
-localparam UNITY = EXTEND'(1<<FRAC_BITS);
 
 localparam signed [WIDTH-1:0] MAX = {1'b0, {(WIDTH-1){1'b1}}};
 localparam signed [WIDTH-1:0] MIN = {1'b1, {(WIDTH-1){1'b0}}};
 
-typedef enum logic [2:0] {
-    LOAD, STORE, DONE, CLEAR
+typedef enum logic [3:0] {
+    LOAD, MAC1, MAC2, MAC3, SAT, STORE, DONE, CLEAR
 } state_t;
 
+typedef enum logic {
+    LEFT, RIGHT
+} channel_t;
+
 state_t state;
+channel_t channel;
 
 // Configuration and handshake control
 logic bypass_r;
 logic [FRAC_BITS-1:0] fb_r;
 logic [EXTEND-1:0] w_r;
-logic [9:0] delay_ms_r;
 logic ram_skip;
 assign ram_skip = bypass_r || c_buffer_used == 0;
 assign valid_o = (state == DONE);
 assign ready_o = (state == LOAD) && !reset;
-
-// Circular buffer
-logic signed [WIDTH-1:0] c_buffer_left [0:C_BUFFER_SIZE-1];
-logic signed [WIDTH-1:0] c_buffer_right [0:C_BUFFER_SIZE-1];
  
 logic [BUFFER_ADD_WIDTH-1:0] c_buffer_used;
-assign c_buffer_used = BUFFER_ADD_WIDTH'(delay_ms_r*SAMPLE_F/1000);
 
 logic [BUFFER_ADD_WIDTH-1:0] ptr;
 logic [BUFFER_ADD_WIDTH-1:0] clear_addr;
 
 // Registers for input samples
-logic signed [WIDTH-1:0] ld_i_r, rd_i_r;
+logic signed [WIDTH-1:0] input_r;
+logic signed [WIDTH-1:0] right_pending_r;
 
-// Registers for current old sample
-logic signed[WIDTH-1:0] delay_left_r;
-logic signed[WIDTH-1:0] delay_right_r;
+// Registers and wire for the delay
+logic signed [WIDTH-1:0] delay_w;
+logic signed [WIDTH-1:0] left_ram_data, right_ram_data;
+assign delay_w = (channel == LEFT) ? left_ram_data : right_ram_data;
 
-// Wires for the (old samples * feedback configuration value)
-logic signed [EXTEND-1:0] fb_left_w, fb_right_w;
-assign fb_left_w = delay_left_r * $signed({1'b0,fb_r});
-assign fb_right_w = delay_right_r * $signed({1'b0,fb_r});
+// Registers for r-x
+logic signed [WIDTH:0] diff_r;
 
-// Wires for dry calculation
-logic signed [EXTEND-1:0] ld_dry_w, rd_dry_w;
-assign ld_dry_w = EXTEND'(ld_i_r) + (fb_left_w >>> FRAC_BITS);
-assign rd_dry_w = EXTEND'(rd_i_r) + (fb_right_w >>> FRAC_BITS);
+// Registers for r*g
+logic signed[EXTEND-1:0] fb_product_r;
 
-// Wires for data after shifting
-logic signed [WIDTH-1:0] ld_dry_sat_w, rd_dry_sat_w;
+// Wire for wet unscaled
+logic signed [EXTEND-1:0] wet_unscaled_w;
+assign wet_unscaled_w = diff_r*$signed(w_r);
+// Registers for scaling
+logic signed [EXTEND-1:0]  wet_scaled_r;
+logic signed [EXTEND-1:0]  fb_scaled_r;
 
-// Wires for output calculation
-logic signed [EXTEND-1:0] ld_mac_w, rd_mac_w;
-assign ld_mac_w = ld_i_r*(UNITY-$signed(w_r)) + $signed(w_r)*delay_left_r;
-assign rd_mac_w = rd_i_r*(UNITY-$signed(w_r)) + $signed(w_r)*delay_right_r;
+// Registes before saturation check
+logic signed [EXTEND-1:0] output_raw_r;
+logic signed [EXTEND-1:0] fb_sum_raw_r;
 
-// Wires for data after shifting
-logic signed [EXTEND-1:0] ld_shift_w, rd_shift_w;
-assign ld_shift_w = ld_mac_w >>> FRAC_BITS;
-assign rd_shift_w = rd_mac_w >>> FRAC_BITS;
-
-// Wires for saturation check
-logic signed [WIDTH-1:0] ld_sat_w, rd_sat_w;
+// Registes after saturation check
+logic signed [WIDTH-1:0] output_sat_r;
+logic signed [WIDTH-1:0] fb_sum_sat_r;
 
 // Registers for output
 logic signed [WIDTH-1:0] ld_o_r, rd_o_r;
 assign ld_o = ld_o_r;
 assign rd_o = rd_o_r;
 
-// Combinational logic for saturation check
+logic left_we, right_we;
+logic [BUFFER_ADD_WIDTH-1:0] left_waddr, right_waddr;
+logic signed [WIDTH-1:0] left_wdata, right_wdata;
+
+audio_bram #(
+    .WIDTH(WIDTH),
+    .DEPTH(C_BUFFER_SIZE)
+) left_bram (
+    .clk(dsp_clk),
+    .rd_addr(ptr),
+    .rd_data(left_ram_data),
+    .wr_addr(left_waddr),
+    .wr_data(left_wdata),
+    .wr_en(left_we)
+);
+
 always_comb begin
-    // for output calculation
-    if ((ld_shift_w) > (EXTEND'(MAX))) begin 
-        ld_sat_w = MAX;
-    end else if ((ld_shift_w) < (EXTEND'(MIN))) begin 
-        ld_sat_w = MIN;
-    end else begin
-          ld_sat_w = WIDTH'(ld_shift_w);
-    end
+    left_we    = 1'b0;
+    left_waddr = ptr;
+    left_wdata = fb_sum_sat_r;
 
-    if ((rd_shift_w) > (EXTEND'(MAX))) begin 
-        rd_sat_w = MAX;
-    end else if ((rd_shift_w) < (EXTEND'(MIN))) begin 
-        rd_sat_w = MIN;
-    end else begin
-          rd_sat_w = WIDTH'(rd_shift_w);
+    if (!reset && state == CLEAR) begin
+        left_we    = 1'b1;
+        left_waddr = clear_addr;
+        left_wdata = '0;
     end
-
-    // for dry calculation
-    if ((ld_dry_w) > (EXTEND'(MAX))) begin 
-        ld_dry_sat_w = MAX;
-    end else if ((ld_dry_w) < (EXTEND'(MIN))) begin 
-        ld_dry_sat_w = MIN;
-    end else begin
-          ld_dry_sat_w = WIDTH'(ld_dry_w);
+    else if (!reset && state == STORE && channel == LEFT) begin
+        left_we = 1'b1;
     end
+end
 
-    if ((rd_dry_w) > (EXTEND'(MAX))) begin 
-        rd_dry_sat_w = MAX;
-    end else if ((rd_dry_w) < (EXTEND'(MIN))) begin 
-        rd_dry_sat_w = MIN;
-    end else begin
-          rd_dry_sat_w = WIDTH'(rd_dry_w);
+audio_bram #(
+    .WIDTH(WIDTH),
+    .DEPTH(C_BUFFER_SIZE)
+) right_bram (
+    .clk(dsp_clk),
+    .rd_addr(ptr),
+    .rd_data(right_ram_data),
+    .wr_addr(right_waddr),
+    .wr_data(right_wdata),
+    .wr_en(right_we)
+);
+
+always_comb begin
+    right_we    = 1'b0;
+    right_waddr = ptr;
+    right_wdata = fb_sum_sat_r;
+
+    if (!reset && state == CLEAR) begin
+        right_we    = 1'b1;
+        right_waddr = clear_addr;
+        right_wdata = '0;
+    end
+    else if (!reset && state == STORE && channel == RIGHT) begin
+        right_we = 1'b1;
     end
 end
 
 always_ff @(posedge dsp_clk) begin
     if (reset) begin
-        delay_left_r <= 0;
-        delay_right_r <= 0;
-        ld_i_r <= 0;
-        rd_i_r <= 0;
+        right_pending_r <= 0;
+        input_r <= 0;
+        diff_r <= 0;
+        fb_product_r <= 0;
+        wet_scaled_r <= 0;
+        fb_scaled_r <= 0;
+        output_raw_r <= 0;
+        fb_sum_raw_r <= 0;
+        output_sat_r <= 0;
+        fb_sum_sat_r <= 0;
         ld_o_r <= 0;
         rd_o_r <= 0;
         ptr <= 0;
@@ -145,26 +167,27 @@ always_ff @(posedge dsp_clk) begin
         w_r <= EXTEND'(w_i);
         bypass_r <= bypass;
         clear_addr <= 0;
+        channel <= LEFT;
         state <= CLEAR;
 
         if (delay_i > MAX_DELAY_MS) begin
-            delay_ms_r <= 10'(MAX_DELAY_MS);
+            c_buffer_used <= BUFFER_ADD_WIDTH'(MAX_DELAY_MS*SAMPLE_F);
         end else begin
-            delay_ms_r <= delay_i;
+            c_buffer_used <= BUFFER_ADD_WIDTH'(delay_i*SAMPLE_F);
         end
-
     end
+
     else begin 
         case (state)
             LOAD: begin
                 if (valid_i && ready_o) begin
-                    ld_i_r <= ld_i;
-                    rd_i_r <= rd_i;
                     if (!ram_skip) begin
-                        delay_left_r <= c_buffer_left[ptr];
-                        delay_right_r <= c_buffer_right[ptr];
-                        state <= STORE;
-                    end else begin
+                        input_r <= ld_i;
+                        right_pending_r <= rd_i;
+                        channel <= LEFT;
+                        state <= MAC1;
+                        end
+                    else begin
                         ld_o_r <= ld_i;
                         rd_o_r <= rd_i;
                         state <= DONE;
@@ -172,15 +195,59 @@ always_ff @(posedge dsp_clk) begin
                 end
             end
 
-            STORE: begin
-                c_buffer_left[ptr] <= ld_dry_sat_w;
-                c_buffer_right[ptr] <= rd_dry_sat_w;
-                ptr <= (ptr == c_buffer_used - 1'b1 ) ? 0 : ptr + 1'b1;
-                ld_o_r <= ld_sat_w;
-                rd_o_r <= rd_sat_w;  
-                              
-                state <= DONE;
+            MAC1: begin // calculate r-x for output and r*g for feedback
+                diff_r <= $signed({delay_w[WIDTH-1], delay_w}) - $signed({input_r[WIDTH-1], input_r});
+                fb_product_r <= delay_w*$signed({1'b0,fb_r});
+                state <= MAC2;
             end
+
+            MAC2: begin //scaled the feedback product and diff*w product
+                fb_scaled_r <= EXTEND'(fb_product_r) >>> FRAC_BITS;
+                wet_scaled_r <= (wet_unscaled_w) >>> FRAC_BITS;
+                state <= MAC3;
+            end
+            
+            MAC3: begin // Unsaturated sum
+                fb_sum_raw_r <= EXTEND'(input_r) + fb_scaled_r;
+                output_raw_r <= EXTEND'(input_r) + wet_scaled_r;
+                state <= SAT;
+            end
+
+            SAT: begin
+                if ((output_raw_r) > (EXTEND'(MAX))) begin 
+                    output_sat_r <= MAX;
+                end else if ((output_raw_r) < (EXTEND'(MIN))) begin 
+                    output_sat_r <= MIN;
+                end else begin
+                    output_sat_r <= WIDTH'(output_raw_r);
+                end
+
+                // for dry calculation
+                if ((fb_sum_raw_r) > (EXTEND'(MAX))) begin 
+                    fb_sum_sat_r <= MAX;
+                end else if ((fb_sum_raw_r) < (EXTEND'(MIN))) begin 
+                    fb_sum_sat_r <= MIN;
+                end else begin
+                    fb_sum_sat_r <= WIDTH'(fb_sum_raw_r);
+                end
+
+                state <= STORE;
+            end
+
+            STORE: begin
+                if (channel == LEFT) begin 
+                    ld_o_r <= output_sat_r;
+                    input_r <= right_pending_r;
+                    
+                    channel <= RIGHT;
+                    state <= MAC1;
+                end else begin
+                    rd_o_r <= output_sat_r;
+                    ptr <= (ptr == c_buffer_used - 1'b1 ) ? 0 : ptr + 1'b1;    
+                    state <= DONE;
+                end
+            end
+
     
             DONE: begin
                 if (ready_i) begin
@@ -189,9 +256,6 @@ always_ff @(posedge dsp_clk) begin
             end
 
             CLEAR: begin
-                c_buffer_left[clear_addr] <= 0;
-                c_buffer_right[clear_addr] <= 0;
-
                 if (clear_addr == BUFFER_ADD_WIDTH'(C_BUFFER_SIZE - 1)) begin
                     clear_addr <= 0;
                     state <= LOAD;
