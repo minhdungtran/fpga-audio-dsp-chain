@@ -233,7 +233,7 @@ async def i2s_one_clock_delay_after_ws_edge(dut):
 async def pending_sample_overwrite_uses_latest_sample(dut):
     """
     if two valid_i pulses happen before the next WS 1 -> 0, 
-    the second sample overwrites the first.   
+    the second samples will not go through until the first one has finnished
     """
     OLD_L = 0xFFFFFF
     OLD_R = 0x000121
@@ -256,15 +256,15 @@ async def pending_sample_overwrite_uses_latest_sample(dut):
     await pulse_sample_valid(dut, NEW_L, NEW_R)
 
     left = await receive_i2s_word(dut, 0,  WIDTH)
-    assert left == NEW_L, (
-        f"The transmitter does not overwrite old samples."
-        f"Supposed to get {hex(NEW_L)}, but got {hex(left)}"
+    assert left == OLD_L, (
+        f"The transmitter overwrite old samples."
+        f"Supposed to get {hex(OLD_L)}, but got {hex(left)}"
     )
 
     right = await receive_i2s_word(dut, 1, WIDTH)
-    assert right == NEW_R, (
-        f"The transmitter does not overwrite old samples."
-        f"Supposed to get {hex(NEW_R)}, but got {hex(right)}"
+    assert right == OLD_R, (
+        f"The transmitter overwrite old samples."
+        f"Supposed to get {hex(OLD_R)}, but got {hex(right)}"
     )
 
 
