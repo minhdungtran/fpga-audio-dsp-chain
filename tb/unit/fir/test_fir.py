@@ -162,7 +162,7 @@ async def send_input(dut, left, right):
 
 
 async def receive_output(dut):
-    for _ in range(300):
+    for _ in range(800):
         if int(dut.valid_o.value):
             return (
                 twos_to_int(int(dut.ld_o.value)),

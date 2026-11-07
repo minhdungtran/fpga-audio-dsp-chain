@@ -38,7 +38,7 @@ assign max_ext = {{(ACC_WIDTH-WIDTH){MAX[WIDTH-1]}}, MAX};
 assign min_ext = {{(ACC_WIDTH-WIDTH){MIN[WIDTH-1]}}, MIN};
 
 typedef enum logic[3:0] { 
-  LOAD, WRITE, MAC, ROUND, SAT, STORE, DONE, CLEAR
+  LOAD, WRITE, READ, MULTIPLY, SUM, ROUND, SAT, STORE, DONE, CLEAR
 } state_t;
 
 typedef enum  logic {
@@ -82,6 +82,8 @@ logic [5:0] wr_pointer;
 
 //Calculation
 logic signed [ACC_WIDTH-1:0] accumulator;
+logic signed [ACC_WIDTH-1:0] product;
+logic signed [WIDTH-1:0] ram_value;
 logic signed [ACC_WIDTH-1:0] rounded_acc;
 logic signed [WIDTH-1:0] processed_acc;
 logic signed [WIDTH-1:0] ld_i_r;
@@ -152,21 +154,32 @@ always @(posedge dsp_clk) begin
           accumulator <= 0;
           channel <= LEFT;
           
-          state <= MAC;
+          state <= READ;
         end
 
-        MAC: begin
+        READ: begin
           if (channel == LEFT) begin 
-            accumulator <= accumulator + l_cir_ram[rd_pointer] * selected_coeff;
-            rd_pointer <= (rd_pointer == 0) ? (NUM_TAPS-1) : rd_pointer - 1;
+            ram_value <= l_cir_ram[rd_pointer];
           end else if (channel == RIGHT) begin
-            accumulator <= accumulator + r_cir_ram[rd_pointer] * selected_coeff;
-            rd_pointer <= (rd_pointer == 0) ? (NUM_TAPS-1) : rd_pointer - 1;
+            ram_value <= r_cir_ram[rd_pointer];
           end
+          rd_pointer <= (rd_pointer == 0) ? (NUM_TAPS-1) : rd_pointer - 1;
+          state <= MULTIPLY;
+        end
+
+        MULTIPLY: begin
+          product <= ram_value * selected_coeff;
+          state <= SUM;
+        end
+
+        SUM: begin 
+          accumulator <= accumulator + product;
  
           tap_index <= tap_index + 1;
           if (tap_index == (NUM_TAPS-1)) begin
             state <= ROUND;
+          end else begin
+            state <= READ;
           end
         end
         
@@ -199,7 +212,7 @@ always @(posedge dsp_clk) begin
             rd_pointer <= (wr_pointer == 0) ? (NUM_TAPS-1) : wr_pointer - 1'b1;           
             tap_index <= 0;
             accumulator <= 0;
-            state <= MAC;
+            state <= READ;
           end else if (channel == RIGHT) begin
             ld_o_r <= saved_result;
             rd_o_r <= processed_acc;
