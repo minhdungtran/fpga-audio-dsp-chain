@@ -1,27 +1,35 @@
 .DEFAULT_GOAL := sim
+
 SIM ?= verilator
 TOPLEVEL_LANG ?= verilog
 
-ROOT := $(abspath $(CURDIR)/../../..)
+PROJECT_ROOT := $(abspath $(CURDIR)/../../..)
 
-VERILOG_SOURCES += $(wildcard $(ROOT)/rtl/fifo/*.v)
-VERILOG_SOURCES += $(ROOT)/rtl/top/dsp_fir.v
-VERILOG_SOURCES += $(ROOT)/rtl/i2s/i2s_tx.v
-VERILOG_SOURCES += $(ROOT)/rtl/i2s/i2s_rv.v
-VERILOG_SOURCES += $(ROOT)/rtl/effects/fir.v
+VERILOG_SOURCES += $(wildcard $(PROJECT_ROOT)/rtl/async_fifo/rtl/*.sv)
+VERILOG_SOURCES += $(PROJECT_ROOT)/rtl/top/dsp_fir.sv
+VERILOG_SOURCES += $(PROJECT_ROOT)/rtl/i2s/i2s_tx.sv
+VERILOG_SOURCES += $(PROJECT_ROOT)/rtl/i2s/i2s_rx.sv
+VERILOG_SOURCES += $(PROJECT_ROOT)/rtl/effects/fir.sv
 
 
 TOPLEVEL = dsp_fir
-MODULE = test_dsp_fir
+COCOTB_TEST_MODULES  = test_dsp_fir
 
-COEFF_SRC := $(ROOT)/coefficients/fir_8khz_63tap_q15.mem
-COEFF_DST := $(CURDIR)/fir_8khz_63tap_q15.mem
+# FIR coefficient ROM files
+MEM_SOURCE := $(PROJECT_ROOT)/coefficients/fir/mem
+MEM_TARGET := $(CURDIR)/coefficients/fir/mem
 
-$(COEFF_DST): $(COEFF_SRC)
-	cp $< $@
+.PHONY: prepare-mem
+
+prepare-mem:
+	mkdir -p $(MEM_TARGET)
+	cp $(MEM_SOURCE)/fir_*_q15.mem $(MEM_TARGET)/
+
+sim: prepare-mem
 
 export COCOTB_RESOLVE_X=ZEROS
 export WAVES=1
 
+EXTRA_ARGS += --trace --trace-fst --trace-structs
+
 include $(shell cocotb-config --makefiles)/Makefile.sim
-sim: $(COEFF_DST)

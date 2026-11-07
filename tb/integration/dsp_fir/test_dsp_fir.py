@@ -1,305 +1,353 @@
-import cocotb
-import numpy as np
-from cocotb.clock import Clock
-from cocotb.triggers import FallingEdge, RisingEdge, Timer
-import random as pyrandom
+import random
 from pathlib import Path
 
-DSP_CLK = 20
-I2S_CLK = 325.52
+import cocotb
+from cocotb.clock import Clock
+from cocotb.triggers import RisingEdge, FallingEdge
+
+
 WIDTH = 24
-SLOT_WIDTH = 32
-COEFFICIENT_WIDTH = 16
-FRAC_BITS = 15
 NUM_TAPS = 63
+FRAC_BITS = 15
+COEFF_WIDTH = 16
+BIT_SLOT = 32
+
+DSP_CLK = 20          # 50 MHz
+I2S_CLK = 325.52  # 3.072 MHz, 48 kHz stereo
+
+MAX_24 = (1 << (WIDTH - 1)) - 1
+MIN_24 = -(1 << (WIDTH - 1))
+
+# Same frame-latency convention as dsp_reverb
 LATENCY = 2
+BYPASS_LATENCY = 1
 
-MAX_24 = (1 << (WIDTH - 1)) - 1   #  8388607
-MIN_24 = -(1 << (WIDTH - 1))      # -8388608
+COEFF_DIR = Path("coefficients/fir/mem")
 
-values = []
+MODES = {
+    0: "fir_bright_q15.mem",
+    1: "fir_warm_q15.mem",
+    2: "fir_dark_q15.mem",
+}
 
-TEST_DIR = Path(__file__).resolve().parent
-PROJECT_DIR = TEST_DIR.parents[2]
+def int_to_twos(value, width=WIDTH):
+    return value & ((1 << width) - 1)
 
-file_path = (
-    PROJECT_DIR
-    / "coefficients"
-    / "fir_8khz_63tap_q15.mem"
-)
 
-if not file_path.is_file():
-    raise FileNotFoundError(
-        f"Coefficient file not found: {file_path}"
-    )
+def twos_to_int(value, width=WIDTH):
+    value &= (1 << width) - 1
 
-with file_path.open("r") as f:
-    hex_values = [
-        line.strip()
-        for line in f
-        if line.strip() and not line.strip().startswith("//")
-    ]
+    if value & (1 << (width - 1)):
+        value -= 1 << width
 
-coefficients_int16 = np.array(
-    [int(value, 16) for value in hex_values],
-    dtype=np.uint16
-).view(np.int16)
-
-coefficients_q15 = coefficients_int16.astype(np.float64) / 32768.0
-
-coefficients = [
-    int(value)
-    for value in coefficients_int16
-]
-
-async def reset(dut):
-    await FallingEdge(dut.top_i2s_clk)
-    dut.top_i2s_reset.value = 1
-    await FallingEdge(dut.top_dsp_clk)
-    dut.top_dsp_reset.value = 1
-
-    for _ in range (10): 
-        await RisingEdge(dut.top_i2s_clk)
-
-    dut.top_i2s_reset.value = 0
-    dut.top_dsp_reset.value = 0
-
-    await RisingEdge(dut.top_i2s_clk)
-
-async def generated_WS(dut):
-
-    while True:
-        dut.top_WS.value = 1
-        for _ in range(SLOT_WIDTH):
-            await FallingEdge(dut.top_i2s_clk)
-
-        dut.top_WS.value = 0
-        for _ in range(SLOT_WIDTH):
-            await FallingEdge(dut.top_i2s_clk)
-
-async def clock_start(dut, dsp_period, i2s_period):
-  
-  cocotb.start_soon(Clock(dut.top_dsp_clk, dsp_period, unit="ns").start())
-
-  cocotb.start_soon(Clock(dut.top_i2s_clk, i2s_period, unit="ns").start())
-
-  cocotb.start_soon(generated_WS(dut))
-
-def sat_clip(value, width=24):
-    if value > MAX_24:
-        return MAX_24
-    if value < MIN_24:
-        return MIN_24
     return value
 
-def processing(result):
-    rounded = int(result) + (1 << (FRAC_BITS - 1))
-    scaled = rounded >> FRAC_BITS
-    return sat_clip(scaled, WIDTH)
 
-def two__compliment_to_int(sample, width):
-    sample &= ((1<<width) - 1)
-    # check signed bit
-    if sample & (1 << (width-1) ):
-        sample = sample - (1<<width)
-    return sample
-
-def int_to_two_compliment(value, width):
-    return value & (((1 << width) - 1))
+def sat_clip(value):
+    return max(MIN_24, min(MAX_24, value))
 
 
-def fir_model(input_frames):
+def processing(accumulator):
+    offset = 1 << (FRAC_BITS - 1)
+
+    if accumulator >= 0:
+        rounded = (accumulator + offset) >> FRAC_BITS
+    else:
+        rounded = (accumulator + offset - 1) >> FRAC_BITS
+
+    return sat_clip(rounded)
+
+
+def load_coefficients(mode):
+    path = COEFF_DIR / MODES[mode]
+    coefficients = []
+
+    with path.open("r") as file:
+        for line in file:
+            line = line.strip()
+
+            if line:
+                coefficients.append(
+                    twos_to_int(int(line, 16), COEFF_WIDTH)
+                )
+
+    assert len(coefficients) == NUM_TAPS
+
+    return coefficients
+
+
+def fir_model(input_frames, coefficients, bypass=False):
+    if bypass:
+        return list(input_frames)
 
     expected_output = []
 
-    for n in range(len(input_frames)): 
-      left_accumulator = 0
-      right_accumulator = 0
+    for n in range(len(input_frames)):
+        left_accumulator = 0
+        right_accumulator = 0
 
-      for k in range(NUM_TAPS):
-          if n - k >= 0:
-              left_accumulator += (
-                  input_frames[n - k][0] * coefficients[k]
-              )
+        for k in range(NUM_TAPS):
+            if n - k >= 0:
+                left_sample, right_sample = input_frames[n - k]
 
-              right_accumulator += (
-                  input_frames[n - k][1] * coefficients[k]
-              )
-      
-      expected_output.append(
-          (processing(left_accumulator),
-           processing(right_accumulator))
-      )
+                left_accumulator += left_sample * coefficients[k]
+                right_accumulator += right_sample * coefficients[k]
+
+        expected_output.append(
+            (
+                processing(left_accumulator),
+                processing(right_accumulator),
+            )
+        )
 
     return expected_output
 
-async def send_i2s_word(dut, audio, width = WIDTH): 
 
-    await RisingEdge(dut.top_i2s_clk) # 1 clock delay
+async def generated_WS(dut):
+    while True:
+        dut.ws.value = 1
 
-    for i in range(width-1,-1,-1):
-        await FallingEdge(dut.top_i2s_clk)
-        bit = (audio >> i) & 1
-        dut.top_in_SD.value = bit
+        for _ in range(BIT_SLOT):
+            await FallingEdge(dut.i2s_clk)
 
-async def send_i2s_frame(dut, left_audio, right_audio):
-    await FallingEdge(dut.top_WS)
-    await send_i2s_word(dut, left_audio, WIDTH)
-    await RisingEdge(dut.top_WS)
-    await send_i2s_word(dut, right_audio, WIDTH)
+        dut.ws.value = 0
 
-async def send_frames(dut, input_frames):
-    for left, right in input_frames:
+        for _ in range(BIT_SLOT):
+            await FallingEdge(dut.i2s_clk)
+
+
+def clock_start(dut):
+    dut.i2s_reset.value = 1
+    dut.dsp_reset.value = 1
+    dut.sd_i.value = 0
+    dut.bypass.value = 0
+    dut.mode_i.value = 0
+
+    cocotb.start_soon(
+        Clock(dut.dsp_clk, DSP_CLK, unit="ns").start()
+    )
+    cocotb.start_soon(
+        Clock(dut.i2s_clk, I2S_CLK, unit="ns").start()
+    )
+    cocotb.start_soon(generated_WS(dut))
+
+
+async def reset(dut, mode=0, bypass=False):
+    await FallingEdge(dut.i2s_clk)
+
+    dut.i2s_reset.value = 1
+    dut.dsp_reset.value = 1
+    dut.sd_i.value = 0
+    dut.mode_i.value = mode
+    dut.bypass.value = int(bypass)
+
+    # Reset both clock domains
+    for _ in range(3):
+        await RisingEdge(dut.i2s_clk)
+
+    await FallingEdge(dut.i2s_clk)
+
+    assert int(dut.chain_ready_o.value) == 0, (
+        "chain_ready_o should be low during reset"
+    )
+
+    dut.i2s_reset.value = 0
+    dut.dsp_reset.value = 0
+
+    # FIR must clear its 63 sample-memory locations
+    for _ in range(5):
+        await FallingEdge(dut.dsp_clk)
+
+        assert int(dut.chain_ready_o.value) == 0, (
+            "FIR reported ready before initialization"
+        )
+
+    # Wait until the FIR finishes initialization
+    for _ in range(NUM_TAPS + 50):
+        await FallingEdge(dut.dsp_clk)
+
+        if int(dut.chain_ready_o.value):
+            break
+    else:
+        raise AssertionError("FIR startup initialization timeout")
+
+    # Allow chain readiness to cross into the I2S domain
+    # and synchronize to complete I2S frames.
+    await FallingEdge(dut.ws)
+    await FallingEdge(dut.ws)
+
+
+async def send_i2s_word(dut, audio):
+    audio = int_to_twos(audio)
+
+    await RisingEdge(dut.i2s_clk)
+
+    for i in range(WIDTH - 1, -1, -1):
+        await FallingEdge(dut.i2s_clk)
+        dut.sd_i.value = (audio >> i) & 1
+
+
+async def send_i2s_frame(dut, left, right):
+    await FallingEdge(dut.ws)
+    await send_i2s_word(dut, left)
+
+    await RisingEdge(dut.ws)
+    await send_i2s_word(dut, right)
+
+
+async def send_frames(dut, frames):
+    for left, right in frames:
         await send_i2s_frame(dut, left, right)
 
-async def receive_i2s_word(dut, width = WIDTH):  
 
-    await FallingEdge(dut.top_i2s_clk) # 1 cycle delay
-    await FallingEdge(dut.top_i2s_clk)
+async def receive_i2s_word(dut):
+    await FallingEdge(dut.i2s_clk)
+    await FallingEdge(dut.i2s_clk)
 
     output = 0
 
-    for i in range(width-1,-1,-1):
-        await RisingEdge(dut.top_i2s_clk)
-        bit = int(dut.top_out_SD.value)
-        output = output | (bit << i)
-        
-    return output
+    for i in range(WIDTH - 1, -1, -1):
+        await RisingEdge(dut.i2s_clk)
+        output |= int(dut.sd_o.value) << i
+
+    return twos_to_int(output)
+
 
 async def receive_i2s_frame(dut):
-    await FallingEdge(dut.top_WS)
-    left = await receive_i2s_word(dut, WIDTH)
-    await RisingEdge(dut.top_WS)
-    right = await receive_i2s_word(dut, WIDTH)
-    return (two__compliment_to_int(left, WIDTH),
-            two__compliment_to_int(right, WIDTH)
-    )
+    await FallingEdge(dut.ws)
+    left = await receive_i2s_word(dut)
 
-async def receive_frames(dut, nbr_of_frames):
-    output_frames = []
+    await RisingEdge(dut.ws)
+    right = await receive_i2s_word(dut)
 
-    for _ in range (nbr_of_frames):
-        left_out, right_out = await receive_i2s_frame(dut)
-        output_frames.append((left_out, right_out))
-
-    return output_frames
+    return left, right
 
 
-def format_frame(frame, index=None):
-    left, right = frame
-    prefix = f"[{index:03d}] " if index is not None else ""
-    return (
-        f"{prefix}"
-        f"L=0x{left & 0xFFFFFF:06X} ({two__compliment_to_int(left, WIDTH):9d})  "
-        f"R=0x{right & 0xFFFFFF:06X} ({two__compliment_to_int(right, WIDTH):9d})"
-    )
+async def receive_frames(dut, count):
+    frames = []
+
+    for _ in range(count):
+        frames.append(await receive_i2s_frame(dut))
+
+    return frames
 
 
-def format_frame_list(title, frames):
-    lines = [title]
-    lines.extend(format_frame(frame, i) for i, frame in enumerate(frames))
-    return "\n".join(lines)
-    
-@cocotb.test()
-async def multiple_frame(dut):
+async def run_frames(dut, input_frames, mode=0, bypass=False):
+    coefficients = load_coefficients(mode)
 
-    await clock_start(dut, dsp_period= DSP_CLK, i2s_period = I2S_CLK)
-    
-    await reset(dut)
-    
-    input_frames = []
-    for i in range(30):
-        input_frames.append((i,i + 100))
-    
-    expected_output = fir_model(input_frames)
+    expected = fir_model(input_frames, coefficients, bypass)
 
-    await FallingEdge(dut.top_WS) # frame synchronization
+    latency = BYPASS_LATENCY if bypass else LATENCY
+
+    # Start input and output concurrently
+    await FallingEdge(dut.ws)
+
     send = cocotb.start_soon(send_frames(dut, input_frames))
-    receive = cocotb.start_soon(receive_frames(dut, len(input_frames) + LATENCY))
+
+    receive = cocotb.start_soon(
+        receive_frames(dut, len(input_frames) + latency)
+    )
 
     await send
-    output_frames = await receive
+    captured = await receive
 
-    actual_output = output_frames[LATENCY: len(input_frames)+LATENCY]
+    actual = captured[latency:latency + len(input_frames)]
 
-    for index, (expected_frame, actual_frame) in enumerate(
-        zip(expected_output, actual_output)
-    ):
-        assert expected_frame == actual_frame, (
-          f"First mismatch at frame: {index}\n"
-          f"Received: {actual_frame}. Expected: {expected_frame}"
+    for i, (got, exp) in enumerate(zip(actual, expected)):
+        assert got == exp, (
+            f"Frame {i} mismatch\n"
+            f"Mode: {mode}, Bypass: {bypass}\n"
+            f"Input: {input_frames[i]}\n"
+            f"Expected: {exp}\n"
+            f"Actual: {got}"
         )
 
-    assert len(expected_output) == len(actual_output), (
-      f"Frame count mismatch: received {len(actual_output)}, "
-      f"expected {len(expected_output)}"
+    dut._log.info(
+        f"PASS: {len(input_frames)} frames, "
+        f"mode={mode}, bypass={bypass}"
     )
-    
+
 
 @cocotb.test()
-async def reset_mid_stream(dut):
+async def test_multiple_frames(dut):
+    clock_start(dut)
 
-    pyrandom.seed(12345)
+    rng = random.Random(42)
 
-    await clock_start(dut, dsp_period= DSP_CLK, i2s_period = I2S_CLK)
-    
-    await reset(dut)
+    frames = [
+        (0, 0),
+        (1000, -1000),
+        (MAX_24, MIN_24),
+        (-1, 1),
+    ]
 
-    initial_frames = []
-    for _ in range(30):
-      left = pyrandom.randint(MIN_24, MAX_24)
-      right = pyrandom.randint(MIN_24, MAX_24)
-      initial_frames.append((left, right))
-
-    second_frames = []
-
-    for _ in range(50):
-      left = pyrandom.randint(MIN_24, MAX_24)
-      right = pyrandom.randint(MIN_24, MAX_24)
-      second_frames.append((left, right))
-    
-    expected_output = fir_model(second_frames)
-    await FallingEdge(dut.top_WS) 
-    init_send = cocotb.start_soon(send_frames(dut, initial_frames))
-
-    #reset in the middle of a frame
-    await RisingEdge(dut.top_WS)
-    await reset(dut)
-    init_send.cancel()
-    
-    await FallingEdge(dut.top_WS)
-    send = cocotb.start_soon(send_frames(dut, second_frames))
-    receive = cocotb.start_soon(receive_frames(dut, len(second_frames) + LATENCY))
-
-    await send
-    output_frames = await receive
-
-    actual_output = output_frames[LATENCY: len(second_frames)+LATENCY]
-
-    for index, (expected_frame, actual_frame) in enumerate(
-        zip(expected_output, actual_output)
-    ):
-        assert expected_frame == actual_frame, (
-          f"First mismatch at frame: {index}\n"
-          f"Received: {actual_frame}. Expected: {expected_frame}"
+    frames += [
+        (
+            rng.randint(MIN_24, MAX_24),
+            rng.randint(MIN_24, MAX_24),
         )
+        for _ in range(100)
+    ]
 
-    assert len(expected_output) == len(actual_output), (
-      f"Frame count mismatch: received {len(actual_output)}, "
-      f"expected {len(expected_output)}"
+    for mode in [0, 1, 2]:
+        await reset(dut, mode=mode, bypass=False)
+        await run_frames(dut, frames, mode=mode)
+
+
+@cocotb.test()
+async def test_bypass(dut):
+    clock_start(dut)
+
+    frames = [
+        (0, 0),
+        (1000, -500),
+        (-3000, 1500),
+        (MAX_24, MIN_24),
+        (-1, 1),
+        (500000, -500000),
+    ]
+
+    await reset(dut, mode=1, bypass=True)
+
+    await run_frames(
+        dut,
+        frames,
+        mode=1,
+        bypass=True,
     )
-    
 
 
+@cocotb.test()
+async def test_reset_startup(dut):
+    clock_start(dut)
 
+    # Fill the FIR circular buffers with nonzero samples
+    await reset(dut, mode=0)
 
+    before_reset = [
+        (100000, -100000),
+        (500000, 250000),
+        (MAX_24, MIN_24),
+    ] * 10
 
+    await run_frames(dut, before_reset, mode=0)
 
+    # Reset both clock domains and select a different mode.
+    # The old sample history must be cleared.
+    await reset(dut, mode=2)
 
+    assert int(dut.chain_ready_o.value) == 1, (
+        "FIR should be ready after initialization"
+    )
 
+    # Test new input against a fresh zero-history FIR model
+    after_reset = [
+        (500000, -500000),
+        (0, 0),
+        (-100000, 100000),
+    ] + [(0, 0)] * (NUM_TAPS + 3)
 
-
-
+    await run_frames(dut, after_reset, mode=2)
 
 
   
