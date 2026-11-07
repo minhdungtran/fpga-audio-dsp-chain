@@ -3,28 +3,48 @@
 SIM ?= verilator
 TOPLEVEL_LANG ?= verilog
 
-ROOT := $(abspath $(CURDIR)/../../..)
+PROJECT_ROOT := $(abspath $(CURDIR)/../../..)
 
-VERILOG_SOURCES += $(wildcard $(ROOT)/rtl/fifo/*.v)
-VERILOG_SOURCES += $(ROOT)/rtl/top/dsp_chain.v
-VERILOG_SOURCES += $(ROOT)/rtl/i2s/i2s_tx.v
-VERILOG_SOURCES += $(ROOT)/rtl/i2s/i2s_rv.v
-VERILOG_SOURCES += $(ROOT)/rtl/effects/fir.v
-VERILOG_SOURCES += $(ROOT)/rtl/effects/amplifier.v
-VERILOG_SOURCES += $(ROOT)/rtl/effects/tremolo_lfo.v
+VERILOG_SOURCES += $(wildcard $(PROJECT_ROOT)/rtl/async_fifo/rtl/*.sv)
+VERILOG_SOURCES += $(PROJECT_ROOT)/rtl/top/dsp_chain.sv
+VERILOG_SOURCES += $(PROJECT_ROOT)/rtl/i2s/i2s_tx.sv
+VERILOG_SOURCES += $(PROJECT_ROOT)/rtl/i2s/i2s_rx.sv
+VERILOG_SOURCES += $(PROJECT_ROOT)/rtl/memory/audio_bram.sv
+VERILOG_SOURCES += $(PROJECT_ROOT)/rtl/effects/fir.sv
+VERILOG_SOURCES += $(PROJECT_ROOT)/rtl/effects/delay.sv
+VERILOG_SOURCES += $(PROJECT_ROOT)/rtl/effects/amplifier.sv
+VERILOG_SOURCES += $(PROJECT_ROOT)/rtl/effects/reverb/reverb.sv
+VERILOG_SOURCES += $(PROJECT_ROOT)/rtl/effects/reverb/room_lut.sv
+VERILOG_SOURCES += $(PROJECT_ROOT)/rtl/effects/reverb/comb_filter.sv
+VERILOG_SOURCES += $(PROJECT_ROOT)/rtl/effects/reverb/all_pass_filter.sv
+VERILOG_SOURCES += $(PROJECT_ROOT)/rtl/effects/reverb/mix.sv
 
 
 TOPLEVEL = dsp_chain
-MODULE = test_dsp_chain
+COCOTB_TEST_MODULES  = test_dsp_chain
 
-COEFF_SRC := $(ROOT)/coefficients/fir_8khz_63tap_q15.mem
-COEFF_DST := $(CURDIR)/fir_8khz_63tap_q15.mem
+# FIR coefficient ROM files
+MEM_SOURCE_FIR := $(PROJECT_ROOT)/coefficients/fir/mem
+MEM_TARGET_FIR := $(CURDIR)/coefficients/fir/mem
 
-$(COEFF_DST): $(COEFF_SRC)
-	cp $< $@
+MEM_SOURCE_REVERB := $(PROJECT_ROOT)/coefficients/reverb/mem
+MEM_TARGET_REVERB := $(CURDIR)/coefficients/reverb/mem
+
+.PHONY: prepare-mem
+
+prepare-mem:
+	mkdir -p $(MEM_TARGET_FIR)
+	mkdir -p $(MEM_TARGET_REVERB)
+
+	cp $(MEM_SOURCE_FIR)/fir_*_q15.mem $(MEM_TARGET_FIR)/
+	cp $(MEM_SOURCE_REVERB)/comb_*_g.mem $(MEM_TARGET_REVERB)/
+
+
+sim: prepare-mem
 
 export COCOTB_RESOLVE_X=ZEROS
 export WAVES=1
 
+EXTRA_ARGS += --trace --trace-fst --trace-structs
+
 include $(shell cocotb-config --makefiles)/Makefile.sim
-sim: $(COEFF_DST)

@@ -1,669 +1,696 @@
-import cocotb
 import random
-import math
-import numpy as np
 from pathlib import Path
+from functools import lru_cache
+
+import cocotb
 from cocotb.clock import Clock
-from cocotb.triggers import FallingEdge, RisingEdge, with_timeout
+from cocotb.triggers import RisingEdge, FallingEdge
 
-
-DSP_CLK = 20
-I2S_CLK = 325.52
 WIDTH = 24
-SLOT_WIDTH = 32
-FIR_FRAC_BITS = 15
-AMP_FRAC_BITS = 14
-
+BIT_SLOT = 32
 NUM_TAPS = 63
-LATENCY = 3
 
-ON = 1
-OFF = 0
+FRAC_BITS = 14
+FIR_FRAC_BITS = 15
+COEFF_WIDTH = 16
 
-MAX_24 = (1 << (WIDTH - 1)) - 1   #  8388607
-MIN_24 = -(1 << (WIDTH - 1))      # -8388608
+SAMPLE_RATE_HZ = 48000
+MAX_DELAY_MS = 500
 
-TEST_DIR = Path(__file__).resolve().parent
-PROJECT_DIR = TEST_DIR.parents[2]
+DSP_CLK = 20        # 50 MHz
+I2S_CLK = 325.52    # ~3.072 MHz
 
-file_path = (
-    PROJECT_DIR
-    / "coefficients"
-    / "fir_8khz_63tap_q15.mem"
-)
+MAX_24 = (1 << 23) - 1
+MIN_24 = -(1 << 23)
+UNITY = 1 << FRAC_BITS
 
-if not file_path.is_file():
-    raise FileNotFoundError(
-        f"Coefficient file not found: {file_path}"
-    )
+LATENCY = 2
+BYPASS_LATENCY = 1
+MAX_INIT_CYCLES = 80000
 
-with file_path.open("r") as f:
-    hex_values = [
-        line.strip()
-        for line in f
-        if line.strip() and not line.strip().startswith("//")
-    ]
+MEM_ROOT = Path(__file__).resolve().parent / "coefficients"
 
-coefficients_int16 = np.array(
-    [int(value, 16) for value in hex_values],
-    dtype=np.uint16
-).view(np.int16)
+FIR_FILES = {
+    0: "fir_bright_q15.mem",
+    1: "fir_warm_q15.mem",
+    2: "fir_dark_q15.mem",
+    3: "fir_warm_q15.mem",
+}
 
-coefficients_q15 = coefficients_int16.astype(np.float64) / 32768.0
-
-coefficients = [
-    int(value)
-    for value in coefficients_int16
+# [comb_id][room_size]
+DELAYS = [
+    [1070, 1426, 1783],
+    [1336, 1781, 2227],
+    [1480, 1973, 2467],
+    [1574, 2098, 2623],
 ]
 
-async def reset(dut):
-    await FallingEdge(dut.top_i2s_clk)
-    dut.top_i2s_reset.value = 1
-    await FallingEdge(dut.top_dsp_clk)
-    dut.top_dsp_reset.value = 1
+ALL_PASS_DELAYS = [240, 82]
 
-    for _ in range (10): 
-        await RisingEdge(dut.top_i2s_clk)
 
-    dut.top_i2s_reset.value = 0
-    dut.top_dsp_reset.value = 0
+def int_to_twos(value, width=WIDTH):
+    return value & ((1 << width) - 1)
 
-    await RisingEdge(dut.top_i2s_clk)
 
-async def generated_WS(dut):
+def twos_to_int(value, width=WIDTH):
+    value &= (1 << width) - 1
 
-    while True:
-        dut.top_WS.value = 1
-        for _ in range(SLOT_WIDTH):
-            await FallingEdge(dut.top_i2s_clk)
+    if value & (1 << (width - 1)):
+        value -= 1 << width
 
-        dut.top_WS.value = 0
-        for _ in range(SLOT_WIDTH):
-            await FallingEdge(dut.top_i2s_clk)
-
-async def clock_start(dut, dsp_period, i2s_period):
-  
-  cocotb.start_soon(Clock(dut.top_dsp_clk, dsp_period, unit="ns").start())
-
-  cocotb.start_soon(Clock(dut.top_i2s_clk, i2s_period, unit="ns").start())
-
-  cocotb.start_soon(generated_WS(dut))
-
-def sat_clip(value, width=24):
-    if value > MAX_24:
-        return MAX_24
-    if value < MIN_24:
-        return MIN_24
     return value
 
-def processing(result):
-    rounded = int(result) + (1 << (FIR_FRAC_BITS - 1))
-    scaled = rounded >> FIR_FRAC_BITS
-    return sat_clip(scaled, WIDTH)
 
-def two__compliment_to_int(sample, width):
-    sample &= ((1<<width) - 1)
-    # check signed bit
-    if sample & (1 << (width-1) ):
-        sample = sample - (1<<width)
-    return sample
+def sat_clip(value):
+    return max(MIN_24, min(MAX_24, int(value)))
 
-def int_to_two_compliment(value, width):
-    return value & (((1 << width) - 1))
 
-def fir_model(input_frames):
+def convert_u014(value):
+    return max(0, min(UNITY - 1, round(value * UNITY)))
+
+
+def fir_processing(accumulator):
+    offset = 1 << (FIR_FRAC_BITS - 1)
+
+    if accumulator >= 0:
+        rounded = (accumulator + offset) >> FIR_FRAC_BITS
+    else:
+        rounded = (accumulator + offset - 1) >> FIR_FRAC_BITS
+
+    return sat_clip(rounded)
+
+
+@lru_cache(maxsize=None)
+def load_fir_coefficients(mode):
+    filename = FIR_FILES[mode]
+    path = MEM_ROOT / "fir" / "mem" / filename
+
+    with path.open("r") as file:
+        coefficients = [
+            twos_to_int(int(line.strip(), 16), COEFF_WIDTH)
+            for line in file
+            if line.strip()
+        ]
+
+    assert len(coefficients) == NUM_TAPS
+    return coefficients
+
+
+@lru_cache(maxsize=None)
+def load_comb_coefficients(comb_id):
+    path = (
+        MEM_ROOT / "reverb" / "mem"
+        / f"comb_{comb_id}_g.mem"
+    )
+
+    with path.open("r") as file:
+        coefficients = [
+            int(line.strip(), 16)
+            for line in file
+            if line.strip()
+        ]
+
+    assert len(coefficients) >= 3 * 51
+    return coefficients
+
+
+def feedback_coefficient(comb_id, room_size, decay_cfg):
+    # Matches the 3 room modes x 51 decay settings ROM.
+    address = room_size * 51 + decay_cfg
+    return load_comb_coefficients(comb_id)[address]
+
+
+def amp_model(frames, gain, bypass):
+    if bypass:
+        return list(frames)
+
+    return [
+        (
+            sat_clip((ld * gain) >> FRAC_BITS),
+            sat_clip((rd * gain) >> FRAC_BITS),
+        )
+        for ld, rd in frames
+    ]
+
+
+def fir_model(frames, coefficients, bypass=False):
+    if bypass:
+        return list(frames)
 
     expected_output = []
 
-    for n in range(len(input_frames)): 
-      left_accumulator = 0
-      right_accumulator = 0
+    for n in range(len(frames)):
+        left_accumulator = 0
+        right_accumulator = 0
 
-      for k in range(NUM_TAPS):
-          if n - k >= 0:
-              left_sample = two__compliment_to_int(input_frames[n - k][0], WIDTH)
-              right_sample = two__compliment_to_int(input_frames[n - k][1], WIDTH)
+        for k in range(NUM_TAPS):
+            if n - k >= 0:
+                left_sample, right_sample = frames[n - k]
 
-              left_accumulator += (left_sample * coefficients[k])
-              right_accumulator += (right_sample * coefficients[k])
-      
-      expected_output.append(
-          (processing(left_accumulator),
-           processing(right_accumulator))
-      )
+                left_accumulator += left_sample * coefficients[k]
+                right_accumulator += right_sample * coefficients[k]
+
+        expected_output.append(
+            (
+                fir_processing(left_accumulator),
+                fir_processing(right_accumulator),
+            )
+        )
 
     return expected_output
 
-def unsigned_amp_model(sample, gain, frac_bits= AMP_FRAC_BITS, width= WIDTH):
-    return sat_clip((sample*gain) >> frac_bits, width) 
 
-def signed_amp_model(sample, gain):
-    return int_to_two_compliment(
-        unsigned_amp_model(two__compliment_to_int(sample, WIDTH), gain, AMP_FRAC_BITS, WIDTH), WIDTH)
+def delay_model(frames, delay_ms, w, g, bypass):
+    assert 0 <= w < UNITY
+    assert 0 <= g < UNITY
 
-def amp_config(dut, gain):
-    dut.gain_value.value = gain
+    delay_ms = min(delay_ms, MAX_DELAY_MS)
 
-def tremolo_config(dut, control_rate, control_depth):
-    dut.control_rate.value = control_rate
-    dut.control_depth.value = control_depth 
+    buffer_size = delay_ms * SAMPLE_RATE_HZ // 1000
 
-def lfo_rom_value(address):
-   to_rad = address*2*math.pi/256
-   uni_polar = (math.sin(to_rad)+1)/2
-   u014 = round(((1<<14)) * uni_polar)
+    if bypass or buffer_size == 0:
+        return list(frames)
 
-   if u014 == 16384: 
-      u014 = 16383
-   return u014
+    buffer_left = [0] * buffer_size
+    buffer_right = [0] * buffer_size
 
-def next_accumulator(current, control_rate):
-    return (current + int(control_rate)) & 0xFFFF
+    output = []
 
-def expected_gain(gain, address):
-   mask = (1<<16) - 1
-   G = (1<<14)- ((gain*int(lfo_rom_value(address)))>>14)
-   return G & mask
+    for i, (ld, rd) in enumerate(frames):
+        ptr = i % buffer_size
 
-def tremolo_model(input_frames, expected_accumulator, control_rate, control_depth):
-    output_frames = []
-    for frame in input_frames:
-      current = (expected_accumulator >> 8) & 0xFF
-      expected_accumulator = next_accumulator(expected_accumulator, control_rate)
-      gain = expected_gain(control_depth, current)
-      output_frame = tuple(signed_amp_model(sample, gain) for sample in frame)
-      output_frames.append(output_frame)
-    return output_frames
+        old_left = buffer_left[ptr]
+        old_right = buffer_right[ptr]
 
-def dsp_model(input_frames,
-              amp_gain,
-              expected_accumulator, control_rate, control_depth, amp_en, fir_en, trem_en):
+        buffer_left[ptr] = sat_clip(
+            ld + ((old_left * g) >> FRAC_BITS)
+        )
+        buffer_right[ptr] = sat_clip(
+            rd + ((old_right * g) >> FRAC_BITS)
+        )
 
-    if amp_en:   
-      first_change = [
-          tuple(signed_amp_model(sample, amp_gain) for sample in frame) 
-          for frame in input_frames]
-    else: 
-      first_change = input_frames
+        out_left = sat_clip(
+            ld + ((w * (old_left - ld)) >> FRAC_BITS)
+        )
+        out_right = sat_clip(
+            rd + ((w * (old_right - rd)) >> FRAC_BITS)
+        )
+
+        output.append((out_left, out_right))
+
+    return output
 
 
-    if fir_en:
-      second_change = fir_model(first_change)
-    else: 
-      second_change = first_change
+def comb_filter_model(frames, comb_id, room_size, decay_cfg):
+    delay = DELAYS[comb_id][room_size]
+
+    g = feedback_coefficient(
+        comb_id, room_size, decay_cfg
+    )
+
+    mem_left = [0] * delay
+    mem_right = [0] * delay
+
+    output = []
+
+    for n, (left, right) in enumerate(frames):
+        ptr = n % delay
+
+        old_left = mem_left[ptr]
+        old_right = mem_right[ptr]
+
+        mem_left[ptr] = sat_clip(
+            left + ((old_left * g) >> FRAC_BITS)
+        )
+        mem_right[ptr] = sat_clip(
+            right + ((old_right * g) >> FRAC_BITS)
+        )
+
+        output.append((old_left, old_right))
+
+    return output
 
 
-    if trem_en:
-      third_change = tremolo_model(second_change, expected_accumulator, control_rate, control_depth)
-    else: 
-      third_change = second_change
+def normalize_comb_outputs(comb_outputs):
+    result = []
 
-    return [(two__compliment_to_int(l, WIDTH), two__compliment_to_int(r, WIDTH)) for l, r in third_change]
+    for frames in zip(*comb_outputs):
+        sum_left = sum(frame[0] for frame in frames)
+        sum_right = sum(frame[1] for frame in frames)
+
+        result.append(
+            (sum_left >> 2, sum_right >> 2)
+        )
+
+    return result
 
 
-async def send_i2s_word(dut, audio, width = WIDTH): 
+def all_pass_model(frames, delay, diffusion_u014):
+    mem_left = [0] * delay
+    mem_right = [0] * delay
 
-    await RisingEdge(dut.top_i2s_clk) # 1 clock delay
+    output = []
 
-    for i in range(width-1,-1,-1):
-        await FallingEdge(dut.top_i2s_clk)
-        bit = (audio >> i) & 1
-        dut.top_in_SD.value = bit
+    for n, (left, right) in enumerate(frames):
+        ptr = n % delay
 
-async def send_i2s_frame(dut, left_audio, right_audio):
-    await FallingEdge(dut.top_WS)
-    await send_i2s_word(dut, left_audio, WIDTH)
-    await RisingEdge(dut.top_WS)
-    await send_i2s_word(dut, right_audio, WIDTH)
+        old_left = mem_left[ptr]
+        old_right = mem_right[ptr]
 
-async def send_frames(dut, input_frames):
-    for left, right in input_frames:
+        new_left = sat_clip(
+            left + (
+                (old_left * diffusion_u014) >> FRAC_BITS
+            )
+        )
+        new_right = sat_clip(
+            right + (
+                (old_right * diffusion_u014) >> FRAC_BITS
+            )
+        )
+
+        out_left = sat_clip(
+            old_left - (
+                (new_left * diffusion_u014) >> FRAC_BITS
+            )
+        )
+        out_right = sat_clip(
+            old_right - (
+                (new_right * diffusion_u014) >> FRAC_BITS
+            )
+        )
+
+        mem_left[ptr] = new_left
+        mem_right[ptr] = new_right
+
+        output.append((out_left, out_right))
+
+    return output
+
+
+def wet_dry_model(dry_frames, wet_frames, wet):
+    output = []
+
+    for (dl, dr), (wl, wr) in zip(dry_frames, wet_frames):
+        output.append(
+            (
+                sat_clip(dl + (((wl - dl) * wet) >> FRAC_BITS)),
+                sat_clip(dr + (((wr - dr) * wet) >> FRAC_BITS)),
+            )
+        )
+
+    return output
+
+
+def reverb_model(
+    frames,
+    *,
+    bypass,
+    room_size,
+    decay_cfg,
+    diffusion,
+    wet,
+):
+    if bypass:
+        return list(frames)
+
+    comb_outputs = [
+        comb_filter_model(
+            frames, comb_id, room_size, decay_cfg
+        )
+        for comb_id in range(4)
+    ]
+
+    normalized = normalize_comb_outputs(comb_outputs)
+
+    ap0 = all_pass_model(
+        normalized,
+        ALL_PASS_DELAYS[0],
+        diffusion,
+    )
+
+    ap1 = all_pass_model(
+        ap0,
+        ALL_PASS_DELAYS[1],
+        diffusion,
+    )
+
+    return wet_dry_model(frames, ap1, wet)
+
+
+def chain_reference(input_frames, config):
+
+    amp_output = amp_model(
+        input_frames,
+        config["g"],
+        config["amp_bypass"],
+    )
+
+    fir_output = fir_model(
+        amp_output,
+        load_fir_coefficients(config["mode_i"]),
+        config["fir_bypass"],
+    )
+
+    delay_output = delay_model(
+        fir_output,
+        config["delay_i"],
+        config["delay_w_i"],
+        config["fb_i"],
+        config["delay_bypass"],
+    )
+
+    reverb_output = reverb_model(
+        delay_output,
+        bypass=config["reverb_bypass"],
+        room_size=config["room_i"],
+        decay_cfg=config["decay_60"],
+        diffusion=config["diffusion_i"],
+        wet=config["reverb_w_i"],
+    )
+
+    return reverb_output
+
+
+def make_config(**overrides):
+    config = {
+        "amp_bypass": False,
+        "g": 20480,  # 1.25x gain
+
+        "fir_bypass": False,
+        "mode_i": 1,  # Warm
+
+        "delay_bypass": False,
+        "fb_i": convert_u014(0.3),
+        "delay_w_i": convert_u014(0.25),
+        "delay_i": 5,  # 5 ms: echoes after 240 frames
+
+        "reverb_bypass": False,
+        "room_i": 0,       # Small
+        "decay_60": 25,    # 2.5 seconds
+        "reverb_w_i": convert_u014(0.4),
+        "diffusion_i": convert_u014(0.6),
+    }
+
+    config.update(overrides)
+    return config
+
+
+def configuration(dut, config):
+    dut.amp_bypass.value = int(config["amp_bypass"])
+    dut.g.value = int_to_twos(config["g"], 16)
+
+    dut.fir_bypass.value = int(config["fir_bypass"])
+    dut.mode_i.value = config["mode_i"]
+
+    dut.delay_bypass.value = int(config["delay_bypass"])
+    dut.fb_i.value = config["fb_i"]
+    dut.delay_w_i.value = config["delay_w_i"]
+    dut.delay_i.value = config["delay_i"]
+
+    dut.reverb_bypass.value = int(config["reverb_bypass"])
+    dut.room_i.value = config["room_i"]
+    dut.decay_60.value = config["decay_60"]
+    dut.reverb_w_i.value = config["reverb_w_i"]
+    dut.diffusion_i.value = config["diffusion_i"]
+
+
+async def generated_WS(dut):
+    while True:
+        dut.ws.value = 1
+
+        for _ in range(BIT_SLOT):
+            await FallingEdge(dut.i2s_clk)
+
+        dut.ws.value = 0
+
+        for _ in range(BIT_SLOT):
+            await FallingEdge(dut.i2s_clk)
+
+
+def clock_start(dut):
+    dut.i2s_reset.value = 1
+    dut.dsp_reset.value = 1
+    dut.sd_i.value = 0
+    configuration(dut, make_config())
+
+    cocotb.start_soon(
+        Clock(dut.dsp_clk, DSP_CLK, unit="ns").start()
+    )
+    cocotb.start_soon(
+        Clock(dut.i2s_clk, I2S_CLK, unit="ns").start()
+    )
+    cocotb.start_soon(generated_WS(dut))
+
+
+async def reset(dut, config):
+    await FallingEdge(dut.i2s_clk)
+
+    dut.i2s_reset.value = 1
+    dut.dsp_reset.value = 1
+    dut.sd_i.value = 0
+
+    # Configurations are captured during reset
+    configuration(dut, config)
+
+    for _ in range(4):
+        await RisingEdge(dut.i2s_clk)
+
+    await FallingEdge(dut.i2s_clk)
+
+    assert int(dut.chain_ready_o.value) == 0
+
+    dut.i2s_reset.value = 0
+    dut.dsp_reset.value = 0
+
+    # FIR, Delay, Reverb must finish clearing their RAMs
+    for _ in range(MAX_INIT_CYCLES):
+        await FallingEdge(dut.dsp_clk)
+
+        if int(dut.chain_ready_o.value):
+            break
+    else:
+        raise AssertionError(
+            "Timeout waiting for chain initialization"
+        )
+
+    # Allow the readiness synchronizer and I2S RX
+    # to settle on complete frame boundaries.
+    await FallingEdge(dut.ws)
+    await FallingEdge(dut.ws)
+
+    assert int(dut.chain_ready_o.value) == 1
+
+
+async def send_i2s_word(dut, audio):
+    audio = int_to_twos(audio)
+
+    await RisingEdge(dut.i2s_clk)
+
+    for i in range(WIDTH - 1, -1, -1):
+        await FallingEdge(dut.i2s_clk)
+        dut.sd_i.value = (audio >> i) & 1
+
+
+async def send_i2s_frame(dut, left, right):
+    await FallingEdge(dut.ws)
+    await send_i2s_word(dut, left)
+
+    await RisingEdge(dut.ws)
+    await send_i2s_word(dut, right)
+
+
+async def send_frames(dut, frames):
+    for left, right in frames:
         await send_i2s_frame(dut, left, right)
 
-async def receive_i2s_word(dut, width = WIDTH):  
 
-    await FallingEdge(dut.top_i2s_clk) # 1 cycle delay
-    await FallingEdge(dut.top_i2s_clk)
+async def receive_i2s_word(dut):
+    await FallingEdge(dut.i2s_clk)
+    await FallingEdge(dut.i2s_clk)
 
     output = 0
 
-    for i in range(width-1,-1,-1):
-        await RisingEdge(dut.top_i2s_clk)
-        bit = int(dut.top_out_SD.value)
-        output = output | (bit << i)
-        
-    return output
+    for i in range(WIDTH - 1, -1, -1):
+        await RisingEdge(dut.i2s_clk)
+
+        output |= int(dut.sd_o.value) << i
+
+    return twos_to_int(output)
+
 
 async def receive_i2s_frame(dut):
-    await FallingEdge(dut.top_WS)
-    left = await receive_i2s_word(dut, WIDTH)
-    await RisingEdge(dut.top_WS)
-    right = await receive_i2s_word(dut, WIDTH)
-    return (two__compliment_to_int(left, WIDTH),
-            two__compliment_to_int(right, WIDTH)
+    await FallingEdge(dut.ws)
+    left = await receive_i2s_word(dut)
+
+    await RisingEdge(dut.ws)
+    right = await receive_i2s_word(dut)
+
+    return left, right
+
+
+async def receive_frames(dut, count):
+    output = []
+
+    for _ in range(count):
+        output.append(await receive_i2s_frame(dut))
+
+    return output
+
+
+async def run_frames(dut, input_frames, config, label="chain"):
+
+    expected = chain_reference(input_frames, config)
+
+    # Use the measured latency for the corresponding configuration
+    all_bypass = all([
+        config["amp_bypass"],
+        config["fir_bypass"],
+        config["delay_bypass"],
+        config["reverb_bypass"],
+    ])
+
+    latency = BYPASS_LATENCY if all_bypass else LATENCY
+
+    await FallingEdge(dut.ws)
+
+    sender = cocotb.start_soon(
+        send_frames(dut, input_frames)
     )
 
-async def receive_frames(dut, nbr_of_frames):
-    output_frames = []
+    receiver = cocotb.start_soon(
+        receive_frames(dut, len(input_frames) + latency)
+    )
 
-    for _ in range (nbr_of_frames):
-        left_out, right_out = await receive_i2s_frame(dut)
-        output_frames.append((left_out, right_out))
+    await sender
+    captured = await receiver
 
-    return output_frames
+    actual = captured[latency:latency + len(input_frames)]
 
-def dsp_config(dut, amp_en, fir_en, trem_en):
-    dut.amp_en.value = amp_en
-    dut.fir_en.value = fir_en
-    dut.trem_en.value = trem_en
+    assert actual == expected, (
+        f"{label}: Frame comparison failed\n"
+        f"Expected: {expected}\n"
+        f"Actual: {actual}"
+    )
 
-async def run_dsp_chain_test(dut, amp_gain, control_rate, control_depth, expected_accumulator, amp_en, fir_en, trem_en, nbr_of_frames):
+    dut._log.info(
+        f"PASS {label}: {len(input_frames)} frames, "
+        f"latency={latency}"
+    )
+    
 
-    await clock_start(dut, DSP_CLK, I2S_CLK) 
-    dsp_config(dut, amp_en, fir_en, trem_en)
-    tremolo_config(dut, control_rate, control_depth)
-    amp_config(dut, amp_gain)
+@cocotb.test()
+async def test_multiple_frames(dut):
+    clock_start(dut)
 
-    await reset(dut)
+    rng = random.Random(42)
 
-    random.seed(1)
-    input_frames = []
-    for _ in range(nbr_of_frames):
-        left = random.getrandbits(WIDTH)
-        right = random.getrandbits(WIDTH)
-        input_frames.append((left,right))
+    frames = [
+        (0, 0),
+        (1000, -1000),
+        (MAX_24, MIN_24),
+        (-1, 1),
+    ]
 
-    await FallingEdge(dut.top_WS) # frame synchronization
-    send = cocotb.start_soon(send_frames(dut, input_frames))
-    receive = cocotb.start_soon(receive_frames(dut, len(input_frames)+3))
+    frames += [
+        (
+            rng.randint(-2000000, 2000000),
+            rng.randint(-2000000, 2000000),
+        )
+        for _ in range(320)
+    ]
 
-    await send
-    output_frames = await receive
-    expected_frames = dsp_model(input_frames, amp_gain, expected_accumulator, control_rate, control_depth, amp_en, fir_en ,trem_en)
+    # Test all three FIR modes with all effects enabled
+    for mode in [0, 1, 2]:
+        config = make_config(mode_i=mode)
 
-    actual_frames = output_frames[LATENCY: len(input_frames)+LATENCY]
+        await reset(dut, config)
 
-
-    for index, (expected_frame, actual_frame) in enumerate(
-        zip(expected_frames, actual_frames)
-    ):
-        assert expected_frames == actual_frames, (
-          f"First mismatch at frame: {index}\n"
-          f"Received: {expected_frame}. Expected: {actual_frame}"
+        await run_frames(
+            dut,
+            frames,
+            config,
+            label=f"Full chain, FIR mode {mode}",
         )
 
-@cocotb.test()
-async def all_on(dut):
-    await run_dsp_chain_test(dut,
-                            nbr_of_frames= 30,
-                            amp_gain=100,
-                            expected_accumulator=0, control_rate=7, control_depth=8192, 
-                            amp_en= ON, fir_en=ON, trem_en=ON)
-@cocotb.test()
-async def amp_on_only(dut):
-    await run_dsp_chain_test(dut,
-                            nbr_of_frames= 30,
-                            amp_gain=100,
-                            expected_accumulator=0, control_rate=7, control_depth=8192, 
-                            amp_en= ON, fir_en=OFF, trem_en=OFF)
 
 @cocotb.test()
-async def fir_on_only(dut):
-    await run_dsp_chain_test(dut,
-                            nbr_of_frames= 30,
-                            amp_gain=100,
-                            expected_accumulator=0, control_rate=7, control_depth=8192, 
-                            amp_en= OFF, fir_en=ON, trem_en=OFF)
+async def test_all_bypass(dut):
+    clock_start(dut)
 
-@cocotb.test()
-async def trem_on_only(dut):
-    await run_dsp_chain_test(dut,
-                            nbr_of_frames= 30,
-                            amp_gain=100,
-                            expected_accumulator=0, control_rate=7, control_depth=8192, 
-                            amp_en= OFF, fir_en=OFF, trem_en=ON)
-
-@cocotb.test()
-async def all_off(dut):
-    await run_dsp_chain_test(dut,
-                            nbr_of_frames= 30,
-                            amp_gain=100,
-                            expected_accumulator=0, control_rate=7, control_depth=8192, 
-                            amp_en= OFF, fir_en=OFF, trem_en=OFF)
-
-@cocotb.test()
-async def amp_fir_on(dut):
-    await run_dsp_chain_test(dut,
-                            nbr_of_frames= 30,
-                            amp_gain=100,
-                            expected_accumulator=0, control_rate=7, control_depth=8192, 
-                            amp_en= ON, fir_en=ON, trem_en=OFF)
-
-@cocotb.test()
-async def amp_trem_on(dut):
-    await run_dsp_chain_test(dut,
-                            nbr_of_frames= 30,
-                            amp_gain=100,
-                            expected_accumulator=0, control_rate=7, control_depth=8192, 
-                            amp_en= ON, fir_en=OFF, trem_en= ON)
-
-@cocotb.test()
-async def fir_trem_on(dut):
-    await run_dsp_chain_test(dut,
-                            nbr_of_frames= 30,
-                            amp_gain=100,
-                            expected_accumulator=0, control_rate=7, control_depth=8192, 
-                            amp_en= OFF, fir_en=ON, trem_en= ON)
-
-@cocotb.test()
-async def long_run(dut):
-    await run_dsp_chain_test(dut,
-                            nbr_of_frames= 500,
-                            amp_gain=100,
-                            expected_accumulator=0, control_rate=7, control_depth=8192, 
-                            amp_en= ON, fir_en=ON, trem_en=ON)
-
-@cocotb.test()
-async def reset_mid_stream(dut):
-
-    random.seed(1)
-    control_rate = 7
-    control_depth = 8192
-    amp_gain = 100
-    amp_en, fir_en, trem_en = ON, OFF, OFF
-    dsp_config(dut, amp_en, fir_en, trem_en)
-    tremolo_config(dut, control_rate, control_depth)
-    amp_config(dut, amp_gain)
-
-    await clock_start(dut, dsp_period= DSP_CLK, i2s_period = I2S_CLK)
-    await reset(dut)
-
-    initial_frames = []
-    for _ in range(30):
-      left = random.getrandbits(WIDTH)
-      right = random.getrandbits(WIDTH)
-      initial_frames.append((left, right))
-
-    second_frames = []
-
-    for _ in range(50):
-      left = random.getrandbits(WIDTH)
-      right = random.getrandbits(WIDTH)
-      second_frames.append((left, right))
-    
-    expected_output = dsp_model(second_frames, amp_gain, 0, control_rate, control_depth, amp_en, fir_en, trem_en)
-    await FallingEdge(dut.top_WS) 
-    init_send = cocotb.start_soon(send_frames(dut, initial_frames))
-
-    #reset in the middle of a frame
-    await FallingEdge(dut.top_WS)
-
-    for _ in range(12): 
-        await FallingEdge(dut.top_i2s_clk)
-
-    await reset(dut)
-    init_send.cancel()
-    
-    await FallingEdge(dut.top_WS)
-    send = cocotb.start_soon(send_frames(dut, second_frames))
-    receive = cocotb.start_soon(receive_frames(dut, len(second_frames) + LATENCY))
-
-    await send
-    output_frames = await receive
-
-    actual_output = output_frames[LATENCY: len(second_frames)+LATENCY]
-
-    for index, (expected_frame, actual_frame) in enumerate(
-        zip(expected_output, actual_output)
-    ):
-        assert expected_frame == actual_frame, (
-          f"First mismatch at frame: {index}\n"
-          f"Received: {actual_frame}. Expected: {expected_frame}"
-        )
-
-    assert len(expected_output) == len(actual_output), (
-      f"Frame count mismatch: received {len(actual_output)}, "
-      f"expected {len(expected_output)}"
+    config = make_config(
+        amp_bypass=True,
+        fir_bypass=True,
+        delay_bypass=True,
+        reverb_bypass=True,
     )
 
-@cocotb.test()
-async def change_config_mid_stream(dut):
+    frames = [
+        (0, 0),
+        (1000, -1000),
+        (-3000, 1500),
+        (MAX_24, MIN_24),
+        (-1, 1),
+        (500000, -500000),
+    ] * 4
 
-    random.seed(1)
-    control_rate = 7
-    control_depth = 8192
-    amp_gain = 100
-    amp_en, fir_en, trem_en = ON, OFF, ON
-    tremolo_config(dut, control_rate, control_depth)
-    dsp_config(dut, amp_en, fir_en, trem_en)
-    amp_config(dut, amp_gain)
+    await reset(dut, config)
 
-    await clock_start(dut, dsp_period= DSP_CLK, i2s_period = I2S_CLK)
-    await reset(dut)
-
-    initial_frames = []
-    for _ in range(50):
-      left = random.getrandbits(WIDTH)
-      right = random.getrandbits(WIDTH)
-      initial_frames.append((left, right))
-
-    second_frames = []
-
-    for _ in range(50):
-      left = random.getrandbits(WIDTH)
-      right = random.getrandbits(WIDTH)
-      second_frames.append((left, right))
-    
-    await FallingEdge(dut.top_WS) 
-    init_send = cocotb.start_soon(send_frames(dut, initial_frames))
-    receive1 = cocotb.start_soon(receive_frames(dut, len(initial_frames) + LATENCY))
-
-    await init_send
-    output_frames1 = await receive1
-
-    actual_output1 = output_frames1[LATENCY: len(initial_frames)+LATENCY]
-    expected_output1 = dsp_model(initial_frames, amp_gain, 0, control_rate, control_depth, amp_en, fir_en, trem_en)
-
-    assert expected_output1 == actual_output1, (
-        f"Mismatch in the first configuration's output frames\n"
-        f"Received: {actual_output1}. Expected: {expected_output1}"
+    await run_frames(
+        dut,
+        frames,
+        config,
+        label="All bypass",
     )
 
-    #change dsp configuration in the middle of a frame
-    await RisingEdge(dut.top_WS)
-    amp_en2, fir_en2, trem_en2 = OFF, ON, ON
-    dsp_config(dut, amp_en2, fir_en2, trem_en2)
-    await reset(dut)
-    
-    await FallingEdge(dut.top_WS)
-    send = cocotb.start_soon(send_frames(dut, second_frames))
-    receive2 = cocotb.start_soon(receive_frames(dut, len(second_frames) + LATENCY))
-
-    await send
-    output_frames2 = await receive2
-    expected_output2 = dsp_model(second_frames, amp_gain, 0, control_rate, control_depth, amp_en2, fir_en2, trem_en2)
-
-    actual_output2 = output_frames2[LATENCY: len(second_frames)+LATENCY]
-
-    assert expected_output2 == actual_output2, (
-        f"Mismatch in the second configuration's output frames\n"
-        f"Received: {actual_output2}. Expected: {expected_output2}"
-    )
 
 @cocotb.test()
-async def change_amp_mid_stream(dut):
+async def test_reset_startup(dut):
+    clock_start(dut)
 
-    random.seed(1)
-    control_rate = 7
-    control_depth = 8192
-    amp_gain1 = 100
-    amp_en = ON
-    fir_en = OFF
-    trem_en = ON
-    dsp_config(dut, amp_en, fir_en, trem_en)
-    tremolo_config(dut, control_rate, control_depth)
-    amp_config(dut, amp_gain1)
-
-    await clock_start(dut, dsp_period= DSP_CLK, i2s_period = I2S_CLK)
-    await reset(dut)
-
-    initial_frames = []
-    for _ in range(30):
-      left = random.getrandbits(WIDTH)
-      right = random.getrandbits(WIDTH)
-      initial_frames.append((left, right))
-
-    second_frames = []
-
-    for _ in range(30):
-      left = random.getrandbits(WIDTH)
-      right = random.getrandbits(WIDTH)
-      second_frames.append((left, right))
-    
-    await FallingEdge(dut.top_WS) 
-    init_send = cocotb.start_soon(send_frames(dut, initial_frames))
-    receive1 = cocotb.start_soon(receive_frames(dut, len(initial_frames) + LATENCY))
-
-    await init_send
-    output_frames1 = await receive1
-
-    actual_output1 = output_frames1[LATENCY: len(initial_frames)+LATENCY]
-    expected_output1 = dsp_model(initial_frames, amp_gain1, 0, control_rate, control_depth, amp_en, fir_en, trem_en)
-
-    assert expected_output1 == actual_output1, (
-        f"Mismatch in the first configuration's output frames\n"
-        f"Received: {actual_output1}. Expected: {expected_output1}"
+    config_before = make_config(
+        mode_i=0,
+        delay_i=5,
     )
 
-    #change dsp configuration in the middle of a frame
-    await RisingEdge(dut.top_WS)
-    amp_gain2 = 8192
-    amp_config(dut, amp_gain2)
-    await reset(dut)
-    
-    await FallingEdge(dut.top_WS)
-    send = cocotb.start_soon(send_frames(dut, second_frames))
-    receive2 = cocotb.start_soon(receive_frames(dut, len(second_frames) + LATENCY))
+    await reset(dut, config_before)
 
-    await send
-    output_frames2 = await receive2
-    expected_output2 = dsp_model(second_frames, amp_gain2, 0, control_rate, control_depth, amp_en, fir_en, trem_en)
+    # Populate the FIR and delay histories
+    before_reset = [
+        (100000, -100000),
+        (500000, 250000),
+        (MAX_24, MIN_24),
+    ] * 100
 
-    actual_output2 = output_frames2[LATENCY: len(second_frames)+LATENCY]
-
-    assert expected_output2 == actual_output2, (
-        f"Mismatch in the second configuration's output frames\n"
-        f"Received: {actual_output2}. Expected: {expected_output2}"
+    await run_frames(
+        dut,
+        before_reset,
+        config_before,
+        label="Before reset",
     )
 
-@cocotb.test()
-async def change_trem_mid_stream(dut):
-
-    random.seed(1)
-    control_rate1 = 7
-    control_depth1 = 8192
-    amp_gain = 100
-    amp_en, fir_en, trem_en = ON, OFF, ON
-    tremolo_config(dut, control_rate1, control_depth1)
-    dsp_config(dut, amp_en, fir_en, trem_en)
-    amp_config(dut, amp_gain)
-
-    await clock_start(dut, dsp_period= DSP_CLK, i2s_period = I2S_CLK)
-    await reset(dut)
-
-    initial_frames = []
-    for _ in range(20):
-      left = random.getrandbits(WIDTH)
-      right = random.getrandbits(WIDTH)
-      initial_frames.append((left, right))
-
-    second_frames = []
-
-    for _ in range(20):
-      left = random.getrandbits(WIDTH)
-      right = random.getrandbits(WIDTH)
-      second_frames.append((left, right))
-    
-    await FallingEdge(dut.top_WS) 
-    init_send = cocotb.start_soon(send_frames(dut, initial_frames))
-    receive1 = cocotb.start_soon(receive_frames(dut, len(initial_frames) + LATENCY))
-
-    await init_send
-    output_frames1 = await receive1
-
-    actual_output1 = output_frames1[LATENCY: len(initial_frames)+LATENCY]
-    expected_output1 = dsp_model(initial_frames, amp_gain, 0, control_rate1, control_depth1, amp_en, fir_en, trem_en)
-
-    assert expected_output1 == actual_output1, (
-        f"Mismatch in the first configuration's output frames\n"
-        f"Received: {actual_output1}. Expected: {expected_output1}"
+    # Reset the whole chain, changing the FIR mode
+    config_after = make_config(
+        mode_i=2,
+        delay_i=5,
+        room_i=1,
+        decay_60=35,
     )
 
-    #change dsp configuration in the middle of a frame
-    await RisingEdge(dut.top_WS)
-    control_rate2 = 10
-    control_depth2 = 300
-    tremolo_config(dut, control_rate2, control_depth2)
-    await reset(dut)
-    
-    await FallingEdge(dut.top_WS)
-    send = cocotb.start_soon(send_frames(dut, second_frames))
-    receive2 = cocotb.start_soon(receive_frames(dut, len(second_frames) + LATENCY))
+    await reset(dut, config_after)
 
-    await send
-    output_frames2 = await receive2
-    expected_output2 = dsp_model(second_frames, amp_gain, 0, control_rate2, control_depth2, amp_en, fir_en, trem_en)
+    assert int(dut.chain_ready_o.value) == 1
 
-    actual_output2 = output_frames2[LATENCY: len(second_frames)+LATENCY]
+    # The new reference begins with empty audio history.
+    # Previous FIR, delay, and reverb samples must not leak.
+    after_reset = [
+        (500000, -500000),
+        (0, 0),
+        (-100000, 100000),
+    ] + [(0, 0)] * 300
 
-    assert expected_output2 == actual_output2, (
-        f"Mismatch in the second configuration's output frames\n"
-        f"Received: {actual_output2}. Expected: {expected_output2}"
+    await run_frames(
+        dut,
+        after_reset,
+        config_after,
+        label="After reset",
     )
-
-@cocotb.test()
-async def full_dynamic_range_saturation_test(dut):
-    control_rate, control_depth = 7, 8192
-    amp_gain = 32767  
-    amp_en, fir_en, trem_en = ON, ON, OFF
-
-    await clock_start(dut, DSP_CLK, I2S_CLK)
-
-    dsp_config(dut, amp_en, fir_en, trem_en)
-    tremolo_config(dut, control_rate, control_depth)
-    amp_config(dut, amp_gain)
-    await reset(dut)
-
-    MIN_24_BIT = 1 << (WIDTH-1)
-
-    test_streams = {
-        "Full Scale Positive": [(MAX_24, MAX_24) for _ in range(10)],
-        "Full Scale Negative": [(MIN_24_BIT, MIN_24_BIT) for _ in range(10)],
-        "Alternating Impulse": [
-            (MAX_24, MIN_24_BIT) if i % 2 == 0 else (MIN_24_BIT, MAX_24)
-            for i in range(10)
-        ],
-    }
-
-    for stream_name, frames in test_streams.items():
-        dsp_config(dut, amp_en, fir_en, trem_en)
-        tremolo_config(dut, control_rate, control_depth)
-        amp_config(dut, amp_gain)
-        await reset(dut)
-
-        await FallingEdge(dut.top_WS)
-        send = cocotb.start_soon(send_frames(dut, frames))
-        receive = cocotb.start_soon(receive_frames(dut, len(frames) + LATENCY))
-
-        await send
-        out_frames = await receive
-
-        actual = out_frames[LATENCY : len(frames) + LATENCY]
-        expected = dsp_model(frames, amp_gain, 0, control_rate, control_depth, amp_en, fir_en, trem_en)
-
-        assert actual == expected, (
-            f"Saturation failure in '{stream_name}':\n"
-            f"Received: {actual}\nExpected: {expected}"
-        )
-
-   
