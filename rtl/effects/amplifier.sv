@@ -48,7 +48,7 @@ module amplifier
     input logic                             dsp_clk,        
     input logic                               reset,
     input logic                              bypass,
-    input logic         [GAIN_LENGTH-1:0]         g,      // The amplifier constant represent in 8 bits
+    input logic         [GAIN_LENGTH-1:0]         g,      // The amplifier constant represent in 16 bits
     input logic signed  [WIDTH-1:0]            ld_i,      // Left channel data flow in 
     input logic signed  [WIDTH-1:0]            rd_i,      // Right channel data flow in 
     
