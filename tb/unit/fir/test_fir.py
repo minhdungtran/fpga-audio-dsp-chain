@@ -1,303 +1,385 @@
-import random as pyrandom
-import cocotb
-import numpy as np
-from cocotb.clock import Clock
-from cocotb.triggers import RisingEdge
+import random
 from pathlib import Path
 
-CLK_PERIOD_NS = 10
+import cocotb
+from cocotb.clock import Clock
+from cocotb.triggers import FallingEdge, RisingEdge
+
+
 WIDTH = 24
-COEFFICIENT_WIDTH = 16
+COEFF_WIDTH = 16
 FRAC_BITS = 15
 NUM_TAPS = 63
 
-MAX_24 = (1 << (WIDTH - 1)) - 1   #  8388607
-MIN_24 = -(1 << (WIDTH - 1))      # -8388608
+DSP_CLK = 10  # ns
 
-TEST_DIR = Path(__file__).resolve().parent
-PROJECT_DIR = TEST_DIR.parents[2]
+MAX_24 = (1 << (WIDTH - 1)) - 1
+MIN_24 = -(1 << (WIDTH - 1))
 
-file_path = (
-    PROJECT_DIR
-    / "coefficients"
-    / "fir_8khz_63tap_q15.mem"
-)
+COEFF_DIR = Path("coefficients/fir/mem")
 
-if not file_path.is_file():
-    raise FileNotFoundError(
-        f"Coefficient file not found: {file_path}"
-    )
+MODES = {
+    0: "fir_bright_q15.mem",
+    1: "fir_warm_q15.mem",
+    2: "fir_dark_q15.mem",
+    3: "fir_warm_q15.mem",  # Reserved -> Warm
+}
 
-with file_path.open("r") as f:
-    hex_values = [
-        line.strip()
-        for line in f
-        if line.strip() and not line.strip().startswith("//")
-    ]
-
-coefficients_int16 = np.array(
-    [int(value, 16) for value in hex_values],
-    dtype=np.uint16
-).view(np.int16)
-
-coefficients_q15 = coefficients_int16.astype(np.float64) / 32768.0
-
-coefficients = [
-    int(value)
-    for value in coefficients_int16
-]
+def int_to_twos(value, width=WIDTH):
+    return value & ((1 << width) - 1)
 
 
-def sat_clip(value, width=24):
-    if value > MAX_24:
-        return MAX_24
-    if value < MIN_24:
-        return MIN_24
+def twos_to_int(value, width=WIDTH):
+    value &= (1 << width) - 1
+
+    if value & (1 << (width - 1)):
+        value -= 1 << width
+
     return value
 
-def processing(result):
-    rounded = int(result) + (1 << (FRAC_BITS - 1))
-    scaled = rounded >> FRAC_BITS
-    return sat_clip(scaled, WIDTH)
 
-def two__compliment_to_int(sample, width):
-    sample &= ((1<<width) - 1)
-    # check signed bit
-    if sample & (1 << (width-1) ):
-        sample = sample - (1<<width)
-    return sample
-
-def int_to_two_compliment(value, width):
-    return value & (((1 << width) - 1))
+def sat_clip(value):
+    return max(MIN_24, min(MAX_24, value))
 
 
-async def reset(dut):
-    await RisingEdge(dut.clk)
-    dut.reset.value = 1
+def processing(accumulator):
+    # Matches the RTL ROUND state: nearest, ties away from zero
+    offset = 1 << (FRAC_BITS - 1)
 
-    await RisingEdge(dut.clk)
+    if accumulator >= 0:
+        rounded = (accumulator + offset) >> FRAC_BITS
+    else:
+        rounded = (accumulator + offset - 1) >> FRAC_BITS
 
-    dut.reset.value = 0
-    for _ in range(65):
-        await RisingEdge(dut.clk)
+    return sat_clip(rounded)
 
-def fir_model(input_frames):
+
+def load_coefficients(mode):
+    path = COEFF_DIR / MODES[mode]
+
+    coefficients = []
+
+    with path.open("r") as file:
+        for line in file:
+            line = line.strip()
+            if line:
+                coefficients.append(
+                    twos_to_int(int(line, 16), COEFF_WIDTH)
+                )
+
+    assert len(coefficients) == NUM_TAPS
+
+    return coefficients
+
+
+def fir_model(input_frames, coefficients, bypass=False):
+
+    if bypass:
+        return [
+            (twos_to_int(left), twos_to_int(right))
+            for left, right in input_frames
+        ]
 
     expected_output = []
 
-    for n in range(len(input_frames)): 
-      left_accumulator = 0
-      right_accumulator = 0
+    for n in range(len(input_frames)):
+        left_accumulator = 0
+        right_accumulator = 0
 
-      for k in range(NUM_TAPS):
-          if n - k >= 0:
-              left_sample = two__compliment_to_int(input_frames[n - k][0], WIDTH)
-              right_sample = two__compliment_to_int(input_frames[n - k][1], WIDTH)
+        for k in range(NUM_TAPS):
+            if n - k >= 0:
+                left_sample = twos_to_int(
+                    input_frames[n - k][0]
+                )
+                right_sample = twos_to_int(
+                    input_frames[n - k][1]
+                )
 
-              left_accumulator += (left_sample * coefficients[k])
-              right_accumulator += (right_sample * coefficients[k])
-      
-      expected_output.append(
-          (processing(left_accumulator),
-           processing(right_accumulator))
-      )
+                left_accumulator += left_sample * coefficients[k]
+                right_accumulator += right_sample * coefficients[k]
+
+        expected_output.append(
+            (
+                processing(left_accumulator),
+                processing(right_accumulator),
+            )
+        )
 
     return expected_output
 
-async def send_frames(dut, input_frame):
-    actual_output = []
-    for left, right in input_frame:
-        dut.in_LD.value = int_to_two_compliment(left, WIDTH)
-        dut.in_RD.value = int_to_two_compliment(right,WIDTH)
-        dut.data_valid.value = 1
-        await RisingEdge(dut.clk)
-        dut.data_valid.value = 0
 
-        for _ in range(140):
-            await RisingEdge(dut.clk)
-            if dut.data_ready.value == 1:
-                actual_left = two__compliment_to_int(int(dut.out_LD.value),WIDTH)
-                actual_right = two__compliment_to_int(int(dut.out_RD.value),WIDTH)
+async def clock_start(dut):
+    cocotb.start_soon(
+        Clock(dut.dsp_clk, DSP_CLK, unit="ns").start()
+    )
 
-                actual_output.append((actual_left, actual_right))
-        
-    return actual_output
-        
-async def wait_for_output(dut, timeout_cycles=200):
-    for cycle in range(timeout_cycles):
-        await RisingEdge(dut.clk)
 
-        if int(dut.data_ready.value) == 1:
-            return cycle + 1
+async def reset(dut, mode=0, bypass=False):
+    await FallingEdge(dut.dsp_clk)
 
-@cocotb.test()
-async def multiple_random(dut):
+    dut.reset.value = 1
+    dut.valid_i.value = 0
+    dut.ready_i.value = 1
+    dut.ld_i.value = 0
+    dut.rd_i.value = 0
 
-    cocotb.start_soon(Clock(dut.clk, CLK_PERIOD_NS, unit="ns").start())
-   
-    input_frame = []
-    
-    for _ in range(200):
-        left = pyrandom.randint(MIN_24, MAX_24)
-        right = pyrandom.randint(MIN_24, MAX_24)
-        input_frame.append((left,right))
+    # Configuration captured during reset
+    dut.mode_i.value = mode
+    dut.bypass.value = int(bypass)
 
-    await reset(dut)
+    for _ in range(3):
+        await RisingEdge(dut.dsp_clk)
 
-    actual_outputs = await send_frames(dut, input_frame)
+    await FallingEdge(dut.dsp_clk)
+    dut.reset.value = 0
 
-    expected_outputs = fir_model(input_frame)
+    # Wait for FIR circular RAM clearing to finish
+    for _ in range(NUM_TAPS + 10):
+        await FallingEdge(dut.dsp_clk)
+        if int(dut.ready_o.value):
+            return
 
-    assert len(actual_outputs) == len(expected_outputs)
+    raise AssertionError("FIR initialization timeout")
 
-    for frame_number, (expected, actual) in enumerate(
-        zip(expected_outputs, actual_outputs)
-    ):
-        assert actual == expected, (
-            f"Frame {frame_number}: "
-            f"expected={expected}, actual={actual}"
+
+async def send_input(dut, left, right):
+    for _ in range(300):
+        await FallingEdge(dut.dsp_clk)
+
+        if int(dut.ready_o.value):
+            dut.ld_i.value = int_to_twos(left)
+            dut.rd_i.value = int_to_twos(right)
+            dut.valid_i.value = 1
+
+            # Frame accepted at rising edge
+            await RisingEdge(dut.dsp_clk)
+            await FallingEdge(dut.dsp_clk)
+
+            dut.valid_i.value = 0
+            return
+
+    raise AssertionError("Timeout waiting for FIR ready_o")
+
+
+async def receive_output(dut):
+    for _ in range(300):
+        if int(dut.valid_o.value):
+            return (
+                twos_to_int(int(dut.ld_o.value)),
+                twos_to_int(int(dut.rd_o.value)),
+            )
+
+        await FallingEdge(dut.dsp_clk)
+
+    raise AssertionError("Timeout waiting for FIR valid_o")
+
+
+async def run_frames(dut, frames):
+    output = []
+
+    for left, right in frames:
+        await send_input(dut, left, right)
+        output.append(await receive_output(dut))
+
+    return output
+
+
+async def test_with_configuration(
+    dut, frames, mode=0, bypass=False
+):
+    await reset(dut, mode, bypass)
+
+    coefficients = load_coefficients(mode)
+
+    expected = fir_model(
+        frames, coefficients, bypass
+    )
+
+    actual = await run_frames(dut, frames)
+
+    for i, (got, exp) in enumerate(zip(actual, expected)):
+        assert got == exp, (
+            f"Frame {i} failed\n"
+            f"mode={mode}, bypass={bypass}\n"
+            f"input={frames[i]}\n"
+            f"expected={exp}\n"
+            f"actual={got}"
         )
 
 
 @cocotb.test()
-async def all_zero(dut):
+async def test_impulse(dut):
+    await clock_start(dut)
 
-    cocotb.start_soon(Clock(dut.clk, CLK_PERIOD_NS, unit="ns").start())
-   
-    input_frame = []
-    
-    for _ in range(80):
-        left = 0x0
-        right = 0x0
-        input_frame.append((left,right))
+    frames = [
+        (MAX_24, 0),
+        (0, MAX_24),
+    ] + [(0, 0)] * (NUM_TAPS + 3)
 
-    await reset(dut)
-
-    actual_outputs = await send_frames(dut, input_frame)
-
-    expected_outputs = fir_model(input_frame)
-
-    assert len(actual_outputs) == len(expected_outputs)
-
-    for left, right in actual_outputs:
-        assert left == 0, (
-            "Left output should be all zero"
-        )
-        assert right == 0, (
-            "Right output should be all zero"
-        )
-    
-    await reset(dut)
-    
-    for k in range(NUM_TAPS):
-      assert dut.l_cir_ram.value[k] == 0, (
-          "Left output should be all zero"
-      )
-      assert dut.r_cir_ram.value[k] == 0, (
-          "Right output should be all zero"
-      )
-
-
-@cocotb.test()
-async def impulse_on_each_channel(dut):
-
-    cocotb.start_soon(Clock(dut.clk, CLK_PERIOD_NS, unit="ns").start())
-
-    IMPULSE = (1 << FRAC_BITS)
-   
-    left_input_frame = (
-        [(IMPULSE,0)] + [(0,0)]*(NUM_TAPS+5)
-    )
-    right_input_frame = (
-        [(0, IMPULSE)] + [(0,0)]*(NUM_TAPS+5)
-    )
-
-    await reset(dut)
-    
-    actual_left_outputs = await send_frames(dut, left_input_frame)
-    actual_right_outputs = await send_frames(dut, right_input_frame)
-
-    assert len(left_input_frame) == len(actual_left_outputs)
-    assert len(right_input_frame) == len(actual_right_outputs)
-    
-    for tap in range(NUM_TAPS):    
-      expected_output = processing(coefficients[tap]*IMPULSE) 
-      left,right = actual_left_outputs[tap]
-      assert left== expected_output,(
-        f"At tap {tap}\n"
-        f"Got: {left}\n"
-        f"Expect: {expected_output}"
-    )
-      assert right == 0, (
-        f"At tap {tap}\n"
-        f"Got: {left}\n" 
-      )
-      
-    # The impulse response must end after 63 taps.
-    for frame in range(NUM_TAPS, len(actual_left_outputs)):
-        assert actual_left_outputs[frame] == (0, 0), (
-            f"Unexpected output after final tap at frame {frame}: "
-            f"{actual_left_outputs[frame]}"
-        )
-
-    for tap in range(NUM_TAPS):    
-      expected_output = processing(coefficients[tap]*IMPULSE) 
-      left,right = actual_right_outputs[tap]
-      assert right== expected_output,(
-        f"At tap {tap}\n"
-        f"Got: {right}\n"
-        f"Expect: {expected_output}"
-    )
-      assert left == 0, (
-        f"At tap {tap}\n"
-        f"Got: {left}\n" 
-      )
-
-    # The impulse response must end after 63 taps.
-    for frame in range(NUM_TAPS, len(actual_right_outputs)):
-        assert actual_right_outputs[frame] == (0, 0), (
-            f"Unexpected output after final tap at frame {frame}: "
-            f"{actual_right_outputs[frame]}"
+    for mode in range(3):
+        await test_with_configuration(
+            dut,
+            frames=frames,
+            mode=mode,
         )
 
 
 @cocotb.test()
-async def timing_handshake(dut):
-    cocotb.start_soon(Clock(dut.clk, CLK_PERIOD_NS, unit="ns").start())
+async def test_random_frames(dut):
+    await clock_start(dut)
 
-    await reset(dut)
+    rng = random.Random(42)
 
-    dut.in_LD.value = int_to_two_compliment(10, WIDTH)
-    dut.in_RD.value = int_to_two_compliment(20, WIDTH)
-    dut.data_valid.value = 1
+    frames = [
+        (
+            rng.randint(MIN_24, MAX_24),
+            rng.randint(MIN_24, MAX_24),
+        )
+        for _ in range(100)
+    ]
 
-    await RisingEdge(dut.clk)
-    dut.data_valid.value = 0
+    for mode in range(3):
+        await test_with_configuration(
+            dut,
+            frames=frames,
+            mode=mode,
+        )
 
-    latency = await wait_for_output(dut, timeout_cycles=200)
 
-    dut._log.info(
-        f"data_ready received after {latency} cycles"
+@cocotb.test()
+async def test_bypass(dut):
+    await clock_start(dut)
+
+    frames = [
+        (0, 0),
+        (1000, -1000),
+        (MAX_24, MIN_24),
+        (-1, 1),
+        (500000, -500000),
+    ]
+
+    await test_with_configuration(
+        dut,
+        frames=frames,
+        mode=2,
+        bypass=True,
     )
 
-    assert int(dut.data_ready.value) == 1
 
-    await RisingEdge(dut.clk)
+@cocotb.test()
+async def test_saturation(dut):
+    await clock_start(dut)
 
-    assert int(dut.data_ready.value) == 0, (
-        "data_ready must be a one-cycle pulse"
+    mode = 1
+    coefficients = load_coefficients(mode)
+
+    # Construct samples aligned with coefficient signs
+    # to produce a large convolution magnitude.
+    frames = []
+
+    for i in range(NUM_TAPS):
+        coeff = coefficients[NUM_TAPS - 1 - i]
+
+        if coeff >= 0:
+            frames.append((MAX_24, MIN_24))
+        else:
+            frames.append((MIN_24, MAX_24))
+
+    frames += [(0, 0)] * 5
+
+    await test_with_configuration(
+        dut,
+        frames=frames,
+        mode=mode,
     )
 
-   
+
+@cocotb.test()
+async def test_output_handshake(dut):
+    await clock_start(dut)
+    await reset(dut, mode=1)
+
+    await FallingEdge(dut.dsp_clk)
+    dut.ready_i.value = 0
+
+    await send_input(dut, 100000, -100000)
+
+    expected = fir_model(
+        [(100000, -100000)],
+        load_coefficients(1),
+    )[0]
+
+    result = await receive_output(dut)
+
+    assert result == expected
+
+    # Output must remain valid while downstream is busy
+    for _ in range(10):
+        await FallingEdge(dut.dsp_clk)
+
+        assert int(dut.valid_o.value) == 1
+        assert int(dut.ready_o.value) == 0
+
+        current = (
+            twos_to_int(int(dut.ld_o.value)),
+            twos_to_int(int(dut.rd_o.value)),
+        )
+
+        assert current == result
+
+    # Release downstream
+    dut.ready_i.value = 1
+
+    await RisingEdge(dut.dsp_clk)
+    await FallingEdge(dut.dsp_clk)
+
+    assert int(dut.valid_o.value) == 0
+    assert int(dut.ready_o.value) == 1
 
 
+@cocotb.test()
+async def test_reset_mid_stream(dut):
+    await clock_start(dut)
+
+    await reset(dut, mode=0)
+
+    previous_frames = [
+        (100000, -50000),
+        (200000, 100000),
+        (MAX_24, MIN_24),
+    ]
+
+    await run_frames(dut, previous_frames)
+
+    # Reset should clear the previous FIR sample history
+    new_frames = [
+        (500000, -500000),
+        (0, 0),
+    ] + [(0, 0)] * (NUM_TAPS + 2)
+
+    await test_with_configuration(
+        dut,
+        frames=new_frames,
+        mode=2,
+    )
 
 
+@cocotb.test()
+async def test_reserved_mode(dut):
+    await clock_start(dut)
 
+    frames = [
+        (MAX_24, 0),
+        (0, MIN_24),
+        (1000, -2000),
+    ] + [(0, 0)] * 5
 
-        
+    await test_with_configuration(
+        dut,
+        frames=frames,
+        mode=3,
+    )
 
-        
     
 
 
