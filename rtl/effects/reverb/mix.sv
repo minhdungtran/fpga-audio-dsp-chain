@@ -37,7 +37,7 @@ state_t state;
 channel_t channel;
 
 // Configuration
-logic [EXTEND-1:0] w_r;
+logic [FRAC_BITS-1:0] w_r;
 
 // Handshake control
 assign valid_o = (state == DONE);
@@ -55,8 +55,8 @@ logic signed [WIDTH-1:0] right_wet_data_pending;
 logic signed [WIDTH:0] diff_r;
 
 // Wire for wet unscaled
-logic signed [EXTEND-1:0] wet_unscaled_w;
-assign wet_unscaled_w = diff_r*$signed(w_r);
+logic signed [EXTEND+1:0] wet_unscaled_w;
+assign wet_unscaled_w = diff_r*$signed({1'b0, w_r});
 
 // Registes before saturation check
 logic signed [EXTEND-1:0] output_raw_r;
@@ -80,7 +80,7 @@ always_ff @(posedge dsp_clk) begin
         output_sat_r <= 0;
         ld_o_r <= 0;
         rd_o_r <= 0;
-        w_r <= EXTEND'(w_i);
+        w_r <= w_i;
         channel <= LEFT;
         state <= LOAD;
     end
@@ -104,7 +104,7 @@ always_ff @(posedge dsp_clk) begin
             end
 
             SUM: begin //scale and clip diff*w product
-                output_raw_r <= EXTEND'(input_r) + (wet_unscaled_w >>> FRAC_BITS);
+                output_raw_r <=EXTEND'(EXTEND'(input_r) + (wet_unscaled_w >>> FRAC_BITS));
                 state <= SAT;
             end
 
